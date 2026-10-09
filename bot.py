@@ -27,11 +27,12 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -43,6 +44,7 @@ from sqlalchemy import (
     BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text,
     UniqueConstraint, select, func, delete, update
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
 )
@@ -195,6 +197,8 @@ class AdminFlow(StatesGroup):
     broadcast = State()
     material = State()
     mock_test = State()
+    api_key = State()
+    maintenance_message = State()
 
 def esc(value: Any) -> str:
     return html.escape(str(value or ""))
@@ -221,20 +225,36 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     ])
 
 async def get_user(session: AsyncSession, tg_user) -> User:
-    user = (await session.execute(select(User).where(User.telegram_id == tg_user.id))).scalar_one_or_none()
+    """Fetch or create a user safely, including simultaneous /start updates."""
+    user = (await session.execute(
+        select(User).where(User.telegram_id == tg_user.id)
+    )).scalar_one_or_none()
     if user is None:
-        user = User(
-            telegram_id=tg_user.id, username=tg_user.username,
+        candidate = User(
+            telegram_id=tg_user.id,
+            username=tg_user.username,
             full_name=(tg_user.full_name or tg_user.username or "Student")[:160],
-            is_admin=is_admin_id(tg_user.id), access_granted=True,
+            is_admin=is_admin_id(tg_user.id),
+            access_granted=True,
         )
-        session.add(user)
-        await session.flush()
-    else:
-        user.username = tg_user.username
-        user.full_name = (tg_user.full_name or tg_user.username or "Student")[:160]
-        user.last_active_at = now_utc()
-        user.is_admin = user.is_admin or is_admin_id(tg_user.id)
+        session.add(candidate)
+        try:
+            await session.flush()
+            user = candidate
+        except IntegrityError:
+            # Another simultaneous update may have inserted this Telegram ID.
+            # Roll back the failed INSERT and fetch the row that now exists.
+            await session.rollback()
+            user = (await session.execute(
+                select(User).where(User.telegram_id == tg_user.id)
+            )).scalar_one_or_none()
+            if user is None:
+                # Do not hide an unrelated integrity failure.
+                raise
+    user.username = tg_user.username
+    user.full_name = (tg_user.full_name or tg_user.username or "Student")[:160]
+    user.last_active_at = now_utc()
+    user.is_admin = user.is_admin or is_admin_id(tg_user.id)
     if user.ai_date != now_utc().date().isoformat():
         user.ai_date = now_utc().date().isoformat()
         user.ai_count = 0
@@ -265,10 +285,44 @@ async def gate(message: Message, user: User, session: AsyncSession) -> bool:
         return False
     return True
 
-async def ai_generate(prompt: str, image_bytes: bytes | None = None, mime_type: str = "image/jpeg") -> str:
-    if not GEMINI_API_KEY:
-        return ("AI features are not configured yet. Add GEMINI_API_KEY in your hosting environment. "
-                "The rest of the bot works without it.")
+async def current_api_key(session: AsyncSession) -> str:
+    # Prefer a non-empty key configured through the admin panel; otherwise use Render Environment.
+    saved = (await get_setting(session, "gemini_api_key", "")).strip()
+    return saved or GEMINI_API_KEY
+
+
+async def validate_gemini_key(api_key: str) -> tuple[bool, str]:
+    """Make a minimal live Gemini request so invalid keys are not saved."""
+    if not api_key or len(api_key) < 10:
+        return False, "The key looks empty or too short."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {"contents": [{"role": "user", "parts": [{"text": "Reply with the single word OK."}]}],
+               "generationConfig": {"temperature": 0, "maxOutputTokens": 5}}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            response = await client.post(url, params={"key": api_key}, json=payload)
+        if response.status_code == 200:
+            return True, "Key validated successfully."
+        if response.status_code in (400, 401, 403):
+            return False, "Google rejected this key or the API is not enabled. Check the key and Gemini API access."
+        if response.status_code == 404:
+            return False, f"Model '{GEMINI_MODEL}' was not found. Check GEMINI_MODEL in Render Environment."
+        if response.status_code == 429:
+            return False, "The key reached a quota/rate limit. Try again later or check your Google AI Studio quota."
+        return False, f"Google returned HTTP {response.status_code}. Please check the key and try again."
+    except httpx.TimeoutException:
+        return False, "Validation timed out. Please try again."
+    except httpx.HTTPError:
+        log.exception("Gemini key validation request failed")
+        return False, "Could not reach Google AI. Check the service/network and try again."
+
+
+async def ai_generate(prompt: str, image_bytes: bytes | None = None, mime_type: str = "image/jpeg",
+                      api_key: str | None = None) -> str:
+    api_key = (api_key or GEMINI_API_KEY).strip()
+    if not api_key:
+        return ("AI features are not configured yet. Ask the admin to open Admin Panel → Gemini API key "
+                "and add a valid key. The other bot features can still work.")
     parts: list[dict[str, Any]] = [{"text": prompt}]
     if image_bytes:
         import base64
@@ -285,7 +339,7 @@ async def ai_generate(prompt: str, image_bytes: bytes | None = None, mime_type: 
         }]}
     }
     async with httpx.AsyncClient(timeout=httpx.Timeout(55.0)) as client:
-        response = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
+        response = await client.post(url, params={"key": api_key}, json=payload)
         if response.status_code >= 400:
             log.warning("Gemini API returned %s: %s", response.status_code, response.text[:500])
             if response.status_code in (401, 403):
@@ -482,7 +536,7 @@ async def photo_question(message: Message, bot: Bot, session: AsyncSession, db_u
         f"Student instructions: {caption or 'No extra instructions; answer in the language most suitable for the student.'}"
     )
     await message.answer("🔎 Reading the image and solving the question…")
-    result = await ai_generate(prompt, image_bytes, mime)
+    result = await ai_generate(prompt, image_bytes, mime, api_key=await current_api_key(session))
     await answer_long(message, result)
 
 @router.message(F.document)
@@ -499,7 +553,7 @@ async def document_question(message: Message, bot: Bot, session: AsyncSession, d
         return
     f = await bot.get_file(doc.file_id)
     stream = await bot.download_file(f.file_path)
-    result = await ai_generate("Read and solve this exam question image step by step. Transcribe it first, explain simply, and clearly state the final answer.", stream.read(), doc.mime_type or "image/jpeg")
+    result = await ai_generate("Read and solve this exam question image step by step. Transcribe it first, explain simply, and clearly state the final answer.", stream.read(), doc.mime_type or "image/jpeg", api_key=await current_api_key(session))
     await answer_long(message, result)
 
 @router.message(F.text == "/cancel")
@@ -508,7 +562,7 @@ async def cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Cancelled.", reply_markup=main_keyboard(is_admin_id(message.from_user.id)))
 
-@router.message(F.text)
+@router.message(F.text, StateFilter(None), ~F.text.startswith("/"))
 async def text_router(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
     text = (message.text or "").strip()
     if not text or text.startswith("/"): return
@@ -523,7 +577,8 @@ async def text_router(message: Message, session: AsyncSession, db_user: User, st
         await message.answer("🧠 Thinking…")
         result = await ai_generate(
             "Answer this student's study question. Explain the reasoning step by step, use simple language, "
-            "show formulas/examples when useful, and give a concise final answer.\n\nQuestion:\n" + text
+            "show formulas/examples when useful, and give a concise final answer.\n\nQuestion:\n" + text,
+            api_key=await current_api_key(session)
         )
         await answer_long(message, result)
         return
@@ -549,7 +604,8 @@ async def text_router(message: Message, session: AsyncSession, db_user: User, st
         await message.answer("AI tools are temporarily disabled by the administrator."); return
     if not await check_ai_limit(message, db_user): return
     await message.answer("🧠 I'll treat that as a study question…")
-    result = await ai_generate("Answer this student's question clearly and step by step:\n\n" + text)
+    result = await ai_generate("Answer this student's question clearly and step by step:\n\n" + text,
+                                api_key=await current_api_key(session))
     await answer_long(message, result)
 
 async def list_mock_tests(message: Message, session: AsyncSession, user: User):
@@ -767,7 +823,8 @@ def admin_keyboard():
         [("➕ Add exam", "adm:addexam"), ("➕ Add question", "adm:addq")],
         [("📚 Add material", "adm:addmat"), ("📝 Create mock", "adm:addmock")],
         [("📣 Broadcast", "adm:broadcast"), ("🛠 Maintenance", "adm:maintenance")],
-        [("🔐 Access / ban help", "adm:accesshelp"), ("⚙️ Features", "adm:features")],
+        [("🔑 Gemini API key", "adm:apikey"), ("⚙️ Features", "adm:features")],
+        [("🔐 Access / ban help", "adm:accesshelp")],
     ])
 
 @router.message(F.text == "🛠 Admin Panel")
@@ -829,7 +886,7 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
     elif action == "maint:off":
         await set_setting(session, "maintenance", "false"); await cb.message.answer("Maintenance mode disabled.")
     elif action == "maint:msg":
-        await state.set_state("maintenance_message"); await cb.message.answer("Send the maintenance message.")
+        await state.set_state(AdminFlow.maintenance_message); await cb.message.answer("Send the maintenance message.")
     elif action == "accesshelp":
         await cb.message.answer(
             "Admin commands:\n"
@@ -838,12 +895,83 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
             "/feature materials on|off\n/maintenance on|off\n"
             "For user IDs, use /user or the Users list. Set ADMIN_IDS in hosting environment."
         )
+    elif action == "apikey":
+        saved = await get_setting(session, "gemini_api_key", "")
+        configured = bool(saved or GEMINI_API_KEY)
+        source = "Admin panel" if saved else ("Render Environment" if GEMINI_API_KEY else "Not configured")
+        await cb.message.answer(
+            "🔑 <b>Gemini API configuration</b>\n"
+            f"Status: {'Configured' if configured else 'Missing'}\n"
+            f"Source: {esc(source)}\n\n"
+            "Choose an action. Your key will be validated before saving, and the full key will never be displayed.",
+            reply_markup=inline([
+                [("➕ Add / replace key", "adm:apikey:set")],
+                [("🧪 Test current key", "adm:apikey:test"), ("🗑 Remove saved key", "adm:apikey:remove")],
+                [("↩️ Admin menu", "adm:back")]
+            ])
+        )
+    elif action == "apikey:set":
+        await state.set_state(AdminFlow.api_key)
+        await cb.message.answer("Send the Gemini API key as your next message. It will be validated before saving. Send /cancel to stop.")
+    elif action == "apikey:test":
+        key = await current_api_key(session)
+        if not key:
+            await cb.message.answer("No API key is configured yet.")
+        else:
+            await cb.message.answer("🧪 Validating current key…")
+            ok, detail = await validate_gemini_key(key)
+            await cb.message.answer(("✅ " if ok else "❌ ") + esc(detail))
+    elif action == "apikey:remove":
+        await set_setting(session, "gemini_api_key", "")
+        await cb.message.answer("Saved API key removed. If GEMINI_API_KEY exists in Render Environment, that key will be used as fallback.")
+    elif action == "back":
+        await cb.message.answer("🛠 <b>ExamYatra Admin Panel</b>", reply_markup=admin_keyboard())
     elif action == "features":
         keys = ["ai", "quiz", "mock", "materials"]
         status = "\n".join(f"{k}: {await get_setting(session, 'feature_'+k, 'true')}" for k in keys)
         await cb.message.answer("⚙️ Feature switches:\n" + status + "\nUse /feature NAME on|off.")
     else:
         await cb.message.answer("Unknown admin action.")
+
+@router.message(AdminFlow.api_key)
+async def admin_save_api_key(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
+    if not db_user.is_admin:
+        await state.clear()
+        return
+    key = (message.text or "").strip()
+    if not key or key.startswith("/"):
+        await message.answer("Please send a valid Gemini API key, or /cancel.")
+        return
+    # Best-effort deletion so the secret is not left visible in the Telegram chat.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await message.answer("🧪 Validating the key with Google…")
+    ok, detail = await validate_gemini_key(key)
+    if not ok:
+        await message.answer("❌ " + esc(detail) + "\nThe key was NOT saved. Send another key or /cancel.")
+        return
+    await set_setting(session, "gemini_api_key", key)
+    await state.clear()
+    await message.answer("✅ Gemini API key validated and saved. AI tutor and image-question solving are ready.")
+
+@router.message(AdminFlow.maintenance_message)
+async def admin_save_maintenance_message(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
+    if not db_user.is_admin:
+        await state.clear()
+        return
+    value = (message.text or "").strip()
+    if not value:
+        await message.answer("Please send a non-empty maintenance message.")
+        return
+    await set_setting(session, "maintenance_message", value[:1000])
+    await state.clear()
+    await message.answer("✅ Maintenance message updated.")
+
+@router.message(Command("myid"))
+async def my_id(message: Message):
+    await message.answer(f"Your Telegram user ID is: <code>{message.from_user.id}</code>\nSet this number in Render as ADMIN_IDS to enable the admin panel.")
 
 @router.message(AdminFlow.add_exam)
 async def admin_add_exam(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
@@ -1029,7 +1157,7 @@ class DBMiddleware:
         return await middleware(handler, event, data)
 
 async def on_error(event):
-    log.exception("Unhandled update error", exc_info=event.exception)
+    log.error("Unhandled update error: %r", event.exception, exc_info=(type(event.exception), event.exception, event.exception.__traceback__))
     try:
         if event.update.callback_query:
             await event.update.callback_query.answer("Something went wrong. Please try again.", show_alert=True)
@@ -1066,6 +1194,8 @@ async def main():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     await seed_default_exams()
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS is empty. Set ADMIN_IDS to your Telegram numeric user ID; /admin will otherwise be unavailable.")
     dp.message.middleware(DBMiddleware())
     dp.callback_query.middleware(DBMiddleware())
     dp.errors.register(on_error)
@@ -1076,9 +1206,26 @@ async def main():
         BotCommand(command="help", description="Help and support"),
         BotCommand(command="profile", description="My profile"),
         BotCommand(command="admin", description="Admin panel"),
+        BotCommand(command="myid", description="Show your Telegram ID"),
         BotCommand(command="delete_me", description="Delete my data"),
     ])
     expiry_task = asyncio.create_task(expiry_loop())
+
+    # Render Web Services must bind to PORT. This lightweight HTTP server provides
+    # / and /health while the Telegram bot continues using long polling.
+    async def health(_request):
+        return web.json_response({"status": "ok", "service": "ExamYatra"})
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
+
     try:
         me = await bot.get_me()
         log.info("ExamYatra started as @%s", me.username)
@@ -1088,6 +1235,7 @@ async def main():
         raise
     finally:
         expiry_task.cancel()
+        await runner.cleanup()
         await engine.dispose()
 
 if __name__ == "__main__":
