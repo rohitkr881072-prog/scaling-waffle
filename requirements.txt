@@ -1,11 +1,24 @@
-# Exam Yatra — bot.py (v4)
-# Render: set PYTHON_VERSION=3.11.9 in the environment. All pins ship prebuilt wheels (no Rust/C toolchain needed).
-aiogram>=3.13,<3.16
-aiohttp>=3.9,<3.11
-httpx>=0.27,<0.29
-SQLAlchemy[asyncio]>=2.0.30,<2.1
-aiosqlite>=0.20,<0.22
-asyncpg>=0.29,<0.31
-python-dotenv>=1.0,<2.0
-qrcode[pil]>=7.4,<8.0
-Pillow>=10.3,<11.0
+# Exam Yatra bot — Python 3.11+ (Render: set PYTHON_VERSION=3.11.9 or newer)
+
+# Telegram
+aiogram>=3.7,<4
+
+# HTTP (Gemini REST) + health-check server
+httpx>=0.27
+aiohttp>=3.9
+
+# Database (async SQLAlchemy). SQLite for local, PostgreSQL recommended on Render.
+SQLAlchemy>=2.0,<3
+aiosqlite>=0.20
+asyncpg>=0.29
+
+# Config
+python-dotenv>=1.0
+
+# UPI payment QR codes (pillow is needed for qrcode's image output)
+qrcode>=7.4
+pillow>=10.0
+
+# Result PDF (Noto fonts from ./fonts; uharfbuzz enables correct Hindi conjunct shaping)
+fpdf2>=2.7.9
+uharfbuzz>=0.39.0
