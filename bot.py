@@ -1,39 +1,3 @@
-"""
-Exam Yatra — Telegram competitive-exam preparation bot (v3).
-Run: python bot.py
-
-Environment (see .env.example):
-  BOT_TOKEN (required)             Telegram bot token from @BotFather
-  ADMIN_IDS=123456,789012          Comma-separated numeric Telegram IDs of administrators
-  DATABASE_URL                     sqlite+aiosqlite:///./examyatra.db  or  postgresql://... (normalised to asyncpg)
-  GEMINI_API_KEY (optional)        Can also be saved from Admin Panel → API Management (DB value wins)
-  GEMINI_MODEL=gemini-2.5-flash
-  SUPPORT_CONTACT=@your_support    Initial support contact; can be changed from Admin Panel (DB value wins)
-  MAINTENANCE_MODE=false           Initial value; can be toggled from Admin Panel
-  LOG_LEVEL=INFO
-  PORT=10000                       Set by Render; health-check server binds 0.0.0.0:PORT
-
-v3 upgrade notes (all migrations are additive — no table is dropped, no row is deleted):
-  * Question bank verification workflow (draft / pending / approved / rejected) + admin review tools.
-  * One unified test engine (AI tests and admin mock tests): persisted option order, answers saved
-    per question, scoring only from saved answers, no answer reveal in exam mode, reply keyboard
-    removed during a test and restored afterwards, protect_content on test/result messages.
-  * Two-level main menu, /home, /stop, /cancel; admin commands only in the admin command scope.
-  * Required-channel membership verification (configurable from Admin Panel, multi-channel).
-  * 7-day trial, Premium subscription (price & validity configurable), manual UPI payment with
-    dynamic QR, UTR-first then screenshot, admin approve/reject with idempotent activation.
-  * Database-backed usage policies per tier (free / trial / premium / admin) + per-user overrides,
-    persistent daily counters (IST day boundary).
-  * Study-material library: exam → subject → format, Telegram file_id delivery, admin upload flow.
-  * Account deletion removed. Admin audit log. Maintenance mode & support contact stored in DB.
-
-Honest limitations (documented, not hidden):
-  * protect_content stops forwarding/saving in official clients; Telegram offers no universal
-    screenshot blocking for bot chats and this bot does not claim one.
-  * A payment screenshot is not proof of payment — approval is a manual admin decision.
-  * AI-generated questions are labelled as AI practice questions; only admin-approved questions
-    are called verified. An LLM cannot guarantee zero factual errors.
-"""
 from __future__ import annotations
 
 import asyncio
