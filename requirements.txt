@@ -1,11 +1,13 @@
-aiogram>=3.13,<4
-SQLAlchemy[asyncio]>=2.0,<3
-greenlet>=3.1
-aiosqlite>=0.20
+# PROPOSED - derived from the imports in bot.py. NOT installed or version-tested (no network in my sandbox).
+# Your original requirements file was not uploaded, so I could not audit it.
+aiogram>=3.4,<4
+SQLAlchemy[asyncio]>=2.0,<2.1
+greenlet>=3.0
+aiosqlite>=0.19
 asyncpg>=0.29
-httpx>=0.27
-aiohttp>=3.10
+httpx>=0.25
+aiohttp>=3.9
 python-dotenv>=1.0
 qrcode[pil]>=7.4
-fpdf2>=2.8.2
-uharfbuzz>=0.43
+fpdf2>=2.7
+uharfbuzz>=0.37
