@@ -4557,12 +4557,40 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
         await state.set_state(AdminFlow.mock_test); await state.update_data(step="create"); await cb.answer()
         await msg.answer("📝 Send: <code>Exam name | Test title | duration minutes</code>\nExample: <code>Bihar Police | Constable Set 1 | 30</code>. /cancel to abort."); return
     if action == "mockpub":
-        t = await session.get(MockTest, parse_int(a2, 0) or 0)
-        if t: t.published = not t.published; await audit(session, actor, "mock.publish", str(t.id), str(t.published))
-        await cb.answer("Updated")
-        tests = list((await session.execute(select(MockTest).order_by(MockTest.id.desc()).limit(15))).scalars())
-        rows = [[("➕ Create mock test", "adm:mockadd")]] + [[(f"{'📴' if x.published else '📶'} #{x.id} {x.title[:20]}", f"adm:mockpub:{x.id}"), (f"➕ add Qs #{x.id}", f"adm:mockq:{x.id}")] for x in tests] + [BACK_ADMIN]
-        await edit("📝 <b>Mock tests</b>\n\n" + "\n".join(f"{'🟢' if x.published else '⚪️'} #{x.id} {esc(x.title)} · {x.duration} min" for x in tests), inline(rows)); return
+        test_id = parse_int(a2, 0) or 0
+        t = await session.get(MockTest, test_id)
+        if not t:
+            await cb.answer("Mock test not found.", show_alert=True)
+            return
+
+        # Refuse to publish a test without at least one approved, valid question.
+        if not t.published and len(await mock_servable_questions(session, t.id)) == 0:
+            await cb.answer("Cannot publish: attach at least one approved, valid question first.", show_alert=True)
+            return
+
+        t.published = not t.published
+        await audit(session, actor, "mock.publish", str(t.id), str(t.published))
+        # Commit the toggle before rebuilding the admin UI, so the published state is durable.
+        await session.flush()
+        await session.commit()
+        await session.refresh(t)
+        await cb.answer("Published ✅" if t.published else "Unpublished")
+
+        tests = list((await session.execute(
+            select(MockTest).order_by(MockTest.id.desc()).limit(15)
+        )).scalars())
+        rows = [[("➕ Create mock test", "adm:mockadd")]]
+        for x in tests:
+            icon = "📴" if x.published else "📶"
+            rows.append([(f"{icon} #{x.id} {x.title[:20]}", f"adm:mockpub:{x.id}"),
+                         (f"➕ add Qs #{x.id}", f"adm:mockq:{x.id}")])
+        rows.append(BACK_ADMIN)
+        status_lines = [
+            f"{'🟢 PUBLISHED' if x.published else '⚪️ UNPUBLISHED'} #{x.id} {esc(x.title)} · {x.duration} min"
+            for x in tests
+        ]
+        await edit("📝 <b>Mock tests</b>\\n\\n" + "\\n".join(status_lines), inline(rows))
+        return
     if action == "mockq":
         t = await session.get(MockTest, parse_int(a2, 0) or 0)
         if not t: await cb.answer("Not found.", show_alert=True); return
