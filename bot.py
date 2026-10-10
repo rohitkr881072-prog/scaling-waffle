@@ -1,3 +1,39 @@
+"""
+Exam Yatra — Telegram competitive-exam preparation bot (v3).
+Run: python bot.py
+
+Environment (see .env.example):
+  BOT_TOKEN (required)             Telegram bot token from @BotFather
+  ADMIN_IDS=123456,789012          Comma-separated numeric Telegram IDs of administrators
+  DATABASE_URL                     sqlite+aiosqlite:///./examyatra.db  or  postgresql://... (normalised to asyncpg)
+  GEMINI_API_KEY (optional)        Can also be saved from Admin Panel → API Management (DB value wins)
+  GEMINI_MODEL=gemini-2.5-flash
+  SUPPORT_CONTACT=@your_support    Initial support contact; can be changed from Admin Panel (DB value wins)
+  MAINTENANCE_MODE=false           Initial value; can be toggled from Admin Panel
+  LOG_LEVEL=INFO
+  PORT=10000                       Set by Render; health-check server binds 0.0.0.0:PORT
+
+v3 upgrade notes (all migrations are additive — no table is dropped, no row is deleted):
+  * Question bank verification workflow (draft / pending / approved / rejected) + admin review tools.
+  * One unified test engine (AI tests and admin mock tests): persisted option order, answers saved
+    per question, scoring only from saved answers, no answer reveal in exam mode, reply keyboard
+    removed during a test and restored afterwards, protect_content on test/result messages.
+  * Two-level main menu, /home, /stop, /cancel; admin commands only in the admin command scope.
+  * Required-channel membership verification (configurable from Admin Panel, multi-channel).
+  * 7-day trial, Premium subscription (price & validity configurable), manual UPI payment with
+    dynamic QR, UTR-first then screenshot, admin approve/reject with idempotent activation.
+  * Database-backed usage policies per tier (free / trial / premium / admin) + per-user overrides,
+    persistent daily counters (IST day boundary).
+  * Study-material library: exam → subject → format, Telegram file_id delivery, admin upload flow.
+  * Account deletion removed. Admin audit log. Maintenance mode & support contact stored in DB.
+
+Honest limitations (documented, not hidden):
+  * protect_content stops forwarding/saving in official clients; Telegram offers no universal
+    screenshot blocking for bot chats and this bot does not claim one.
+  * A payment screenshot is not proof of payment — approval is a manual admin decision.
+  * AI-generated questions are labelled as AI practice questions; only admin-approved questions
+    are called verified. An LLM cannot guarantee zero factual errors.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,11 +46,6 @@ import os
 import random
 import re
 import time
-import sqlite3
-import tempfile
-import shutil
-from pathlib import Path
-from decimal import Decimal
 from datetime import datetime, timedelta, timezone, date
 from typing import Any, Awaitable, Callable
 
@@ -40,7 +71,6 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncAttrs, AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 load_dotenv()
@@ -59,8 +89,6 @@ ENV_MAINTENANCE = os.getenv("MAINTENANCE_MODE", "false").lower() in {"1", "true"
 ENV_MAINTENANCE_MESSAGE = os.getenv("MAINTENANCE_MESSAGE", "ExamYatra is being updated. Please try again soon.").strip()
 ENV_SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "").strip()
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_DB_BACKUP_BYTES = int(os.getenv("MAX_DB_BACKUP_MB", "18")) * 1024 * 1024
-DB_BACKUP_LOCK = asyncio.Lock()
 LETTERS = "ABCD"
 TG_TEXT_LIMIT = 3800
 STYLE_SHORT, STYLE_DETAILED = "short", "detailed"
@@ -72,6 +100,19 @@ HISTORY_PAGE = 8
 REVIEW_PAGE = 5
 ADMIN_PAGE = 10
 AI_TEST_DIFFICULTIES = ("easy", "medium", "hard", "mixed")
+TEST_LANGUAGES = {"hi": "🇮🇳 हिन्दी", "en": "🇬🇧 English"}
+TEST_LANGUAGE_NAMES = {"hi": "Hindi (Devanagari script)", "en": "English"}
+_GEN = ["General Knowledge", "General Science", "Indian History", "Indian Geography", "Indian Polity", "Mathematics", "Reasoning", "Current Affairs", "Hindi", "English"]
+DEFAULT_TEST_SUBJECTS: dict[str, list[str]] = {
+    "Bihar Police": ["Hindi", "English", "Mathematics", "Reasoning", "General Knowledge", "General Science", "Indian History", "Indian Geography", "Indian Polity", "Current Affairs", "Bihar GK"],
+    "BPSC": ["General Studies", "Indian History", "Indian Geography", "Indian Polity", "Indian Economy", "General Science", "Current Affairs", "Bihar Special", "Mathematics", "Reasoning", "Hindi"],
+    "SSC": ["English", "Quantitative Aptitude", "Reasoning", "General Awareness", "General Science", "Indian History", "Indian Geography", "Indian Polity", "Current Affairs"],
+    "Railway": ["Mathematics", "Reasoning", "General Science", "General Awareness", "Current Affairs", "Indian History", "Indian Geography", "Indian Polity"],
+    "Banking": ["English", "Quantitative Aptitude", "Reasoning", "Banking Awareness", "Computer Knowledge", "Current Affairs", "General Awareness"],
+    "UPSC": ["Indian History", "Indian Geography", "Indian Polity", "Indian Economy", "Environment & Ecology", "Science & Technology", "Current Affairs", "CSAT", "Art & Culture"],
+    "Teaching Exams": ["Child Development & Pedagogy", "Hindi", "English", "Mathematics", "Environmental Studies", "Science", "Social Studies", "Reasoning"],
+    "_default": _GEN,
+}
 COMMON_TEST_TOPICS = [
     "BPSC", "Bihar Police", "SSC", "Railway", "Banking", "UPSC",
     "General Knowledge", "Indian History", "Geography", "Science",
@@ -437,12 +478,14 @@ class AdminFlow(StatesGroup):
     user_action_value = State()
     setting_value = State()
     reject_reason = State()
-    db_restore_upload = State()
+    restore_upload = State()
 
 
 class TestFlow(StatesGroup):
-    topic = State()
+    exam = State()
+    subject = State()
     custom_topic = State()
+    language = State()
     count = State()
     custom_count = State()
     difficulty = State()
@@ -556,8 +599,10 @@ def inline(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     ])
 
 
-def url_button_rows(rows: list[list[tuple[str, str, bool]]]) -> InlineKeyboardMarkup:
-    """rows of (text, data_or_url, is_url)."""
+def url_button_rows(rows: list[list[tuple[str, str, bool]]]) -> InlineKeyboardMarkup | None:
+    """rows of (text, data_or_url, is_url). Returns None for no rows (Telegram rejects an empty keyboard)."""
+    if not rows:
+        return None
     kb = []
     for row in rows:
         r = []
@@ -1607,15 +1652,33 @@ TEST_SYSTEM = ("You are an expert question setter for Indian competitive exams (
                "unless you are certain. Explanations must justify the correct answer in one to three sentences.")
 
 
-def build_test_prompt(topic: str, n: int, difficulty: str, lang: str, avoid: list[str]) -> str:
-    lang_name = "Hindi (Devanagari script)" if lang == "hi" else "English"
+def build_test_prompt(exam: str, subject: str, topic: str | None, n: int, difficulty: str, lang: str, avoid: list[str]) -> str:
+    lang_name = TEST_LANGUAGE_NAMES.get(lang, "English")
     diff = "a mix of easy, medium and hard" if difficulty == "mixed" else difficulty
     avoid_txt = ("\nDo NOT repeat these questions: " + " | ".join(avoid)) if avoid else ""
-    return (f"Create {n} {diff} MCQs on: {topic}. Language: {lang_name}. Return a JSON array; each item has question, options "
-            f"(exactly 4 strings), correct_index (0-3), explanation, difficulty (easy|medium|hard).{avoid_txt}")
+    scope = f"Subject: {subject}." + (f" Topic / chapter: {topic}. Every question must be about this topic." if topic else " Cover the subject broadly.")
+    return (f"Create {n} {diff} multiple-choice questions for the {exam} examination at its actual exam level and pattern.\n{scope}\n"
+            f"Write the question text, all four options and the explanation entirely in {lang_name}. Do not switch language. "
+            f"Do not drift to another subject. Return a JSON array; each item has question, options (exactly 4 strings), correct_index (0-3), "
+            f"explanation, difficulty (easy|medium|hard).{avoid_txt}")
 
 
-def validate_generated_question(item: Any, seen: set[str]) -> dict[str, Any] | None:
+def language_matches(text: str, options: list[str], lang: str, subject: str) -> bool:
+    """Hindi tests must be in Devanagari; English tests must not be (unless the subject itself is Hindi/Sanskrit,
+    where Devanagari examples inside an English question are legitimate)."""
+    blob = " ".join([text] + options)
+    letters = re.findall(r"[A-Za-z\u0900-\u097F]", blob)
+    if not letters:
+        return True
+    dev = sum(1 for ch in letters if "\u0900" <= ch <= "\u097F") / len(letters)
+    if lang == "hi":
+        return dev >= 0.5
+    if subject.strip().lower() in ("hindi", "sanskrit", "हिन्दी", "हिंदी", "संस्कृत"):
+        return True
+    return dev <= 0.2
+
+
+def validate_generated_question(item: Any, seen: set[str], lang: str | None = None, subject: str = "") -> dict[str, Any] | None:
     if not isinstance(item, dict):
         return None
     text = clean_plain(item.get("question"))
@@ -1636,6 +1699,8 @@ def validate_generated_question(item: Any, seen: set[str]) -> dict[str, Any] | N
         return None
     if any(len(o) > 300 for o in opts) or len(text) > 1200:
         return None
+    if lang and not language_matches(text, opts, lang, subject):
+        return None
     key = normalize_question_text(text)
     if key in seen or any(_near_duplicate(key, s) for s in seen):
         return None
@@ -1653,17 +1718,19 @@ def _near_duplicate(a: str, b: str) -> bool:
     return len(sa & sb) / len(sa | sb) >= 0.85
 
 
-async def generate_test_questions(topic: str, total: int, difficulty: str, lang: str, api_key: str,
+async def generate_test_questions(exam: str, subject: str, topic: str | None, total: int, difficulty: str, lang: str, api_key: str,
                                   progress: Callable[[int, int], Awaitable[None]] | None = None) -> tuple[list[dict[str, Any]], str | None]:
+    """Never substitutes subject or language: items in the wrong language are dropped; if most drops are language
+    mismatches the caller gets err='language' instead of a silently different test."""
     questions: list[dict[str, Any]] = []
     seen: set[str] = set()
-    calls = idle_rounds = rate_limit_hits = 0
+    calls = idle_rounds = rate_limit_hits = lang_rejects = 0
     while len(questions) < total and calls < AI_TEST_MAX_CALLS:
         need = min(AI_TEST_BATCH, total - len(questions))
         ask = min(need + 2, AI_TEST_BATCH + 2)
         avoid = [q["text"][:90] for q in questions[-12:]]
         calls += 1
-        data, err = await ai_generate_json(build_test_prompt(topic, ask, difficulty, lang, avoid), TEST_SCHEMA, api_key,
+        data, err = await ai_generate_json(build_test_prompt(exam, subject, topic, ask, difficulty, lang, avoid), TEST_SCHEMA, api_key,
                                            system=TEST_SYSTEM, temperature=0.8, max_tokens=8192, timeout=90.0)
         if err in ("no_key", "auth", "model", "permission", "quota", "blocked"):
             return questions, err
@@ -1679,8 +1746,10 @@ async def generate_test_questions(topic: str, total: int, difficulty: str, lang:
             await asyncio.sleep(1.5); continue
         added = 0
         for item in data:
-            q = validate_generated_question(item, seen)
+            q = validate_generated_question(item, seen, lang, subject)
             if q is None:
+                if isinstance(item, dict) and isinstance(item.get("options"), list) and validate_generated_question(item, set()) is not None:
+                    lang_rejects += 1        # structurally fine but wrong language
                 continue
             seen.add(normalize_question_text(q["text"])); questions.append(q); added += 1
             if len(questions) >= total:
@@ -1692,11 +1761,12 @@ async def generate_test_questions(topic: str, total: int, difficulty: str, lang:
             try: await progress(len(questions), total)
             except Exception: pass
     if len(questions) < total:
-        return questions, "incomplete"
+        return questions, ("language" if lang_rejects > len(questions) else "incomplete")
     return questions[:total], None
 
 
 GENERATION_ERROR_TEXT = {
+    "language": "The AI kept answering in the wrong language for this subject, so the test was not created. Nothing was saved — try again, or pick the other language.",
     "incomplete": "I couldn't build a complete, valid test for this topic right now. Try again, pick fewer questions or a more specific topic.",
     "parse": "The AI returned questions I couldn't validate. Nothing was saved — please try again.",
 }
@@ -2093,31 +2163,69 @@ async def stop_active_test(bot: Bot, session: AsyncSession, user: User, chat_id:
 
 
 
-# ============================ AI Test Generator — setup flow ============================
-def topic_keyboard(exams: list[Exam]) -> InlineKeyboardMarkup:
-    names_lower = {t.lower() for t in COMMON_TEST_TOPICS}
-    buttons: list[tuple[str, str]] = [(t, f"gt:t:{i}") for i, t in enumerate(COMMON_TEST_TOPICS)]
-    buttons += [(e.name, f"gt:e:{e.id}") for e in exams if e.name.lower() not in names_lower][:10]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([("✍️ Custom Topic", "gt:c")]); rows.append([("❌ Cancel", "gt:x")])
+# ============================ AI Test Generator — setup flow (exam → subject → topic → language → count → difficulty) ============================
+async def exam_subjects(session: AsyncSession, exam: Exam) -> list[str]:
+    """Subjects for an exam: admin-configured list (settings 'test_subjects:<exam_id>'), else the built-in list for
+    that exam name, else the generic list; question-bank subjects of that exam are appended."""
+    configured = [s.strip() for s in (await get_setting(session, f"test_subjects:{exam.id}", "")).split("|") if s.strip()]
+    base = configured or DEFAULT_TEST_SUBJECTS.get(exam.name, DEFAULT_TEST_SUBJECTS["_default"])
+    bank = list((await session.execute(select(Subject.name).where(Subject.exam_id == exam.id).order_by(Subject.name))).scalars())
+    seen = {s.lower() for s in base}
+    return list(base) + [s for s in bank if s.lower() not in seen][:10]
+
+
+def _grid(buttons: list[tuple[str, str]], per_row: int = 2) -> list[list[tuple[str, str]]]:
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def exam_step_keyboard(exams: list[Exam], selected_id: int | None) -> InlineKeyboardMarkup:
+    rows = _grid([(("✅ " if e.id == selected_id else "") + e.name, f"gt:e:{e.id}") for e in exams])
+    rows.append([("❌ Cancel", "gt:x")])
+    return inline(rows)
+
+
+def subject_step_keyboard(subjects: list[str]) -> InlineKeyboardMarkup:
+    rows = _grid([(s, f"gt:s:{i}") for i, s in enumerate(subjects)])
+    rows.append([("✍️ Custom subject / topic", "gt:c")])
+    rows.append([("⬅️ Back", "gt:be"), ("❌ Cancel", "gt:x")])
+    return inline(rows)
+
+
+def topic_step_keyboard() -> InlineKeyboardMarkup:
+    return inline([[("⏭ Whole subject (no specific topic)", "gt:skipc")], [("⬅️ Back", "gt:bs"), ("❌ Cancel", "gt:x")]])
+
+
+def language_step_keyboard(current: str) -> InlineKeyboardMarkup:
+    rows = _grid([((("✅ " if current == code else "") + label), f"gt:l:{code}") for code, label in TEST_LANGUAGES.items()])
+    rows.append([("⬅️ Back", "gt:bc"), ("❌ Cancel", "gt:x")])
     return inline(rows)
 
 
 def count_keyboard(max_q: int) -> InlineKeyboardMarkup:
-    presets = [n for n in (5, 10, 20, 30, 50) if n <= max_q]
-    rows = [[(f"{n} Questions", f"gt:n:{n}") for n in presets[i:i + 2]] for i in range(0, len(presets), 2)]
-    rows.append([("🔢 Custom Number", "gt:nc")]); rows.append([("⬅️ Back", "gt:bt"), ("❌ Cancel", "gt:x")])
+    presets = [n for n in (5, 10, 15, 20, 30, 50) if n <= max_q]
+    rows = _grid([(f"{n} Questions", f"gt:n:{n}") for n in presets], 3)
+    rows.append([("🔢 Custom number", "gt:nc")])
+    rows.append([("⬅️ Back", "gt:bl"), ("❌ Cancel", "gt:x")])
     return inline(rows)
 
 
-def difficulty_keyboard(lang: str) -> InlineKeyboardMarkup:
-    def mark(v: str) -> str: return " ✅" if lang == v else ""
+def difficulty_keyboard() -> InlineKeyboardMarkup:
     return inline([
         [("🟢 Easy", "gt:d:easy"), ("🟡 Medium", "gt:d:medium")],
         [("🔴 Hard", "gt:d:hard"), ("🎲 Mixed", "gt:d:mixed")],
-        [("🇬🇧 English" + mark("en"), "gt:l:en"), ("🇮🇳 हिन्दी" + mark("hi"), "gt:l:hi")],
         [("⬅️ Back", "gt:bn"), ("❌ Cancel", "gt:x")],
     ])
+
+
+def setup_summary(data: dict[str, Any], upto: int) -> str:
+    """Compact progress card shown above every step. upto = number of completed steps."""
+    rows = [("🎯 Exam", data.get("exam_name")), ("📘 Subject", data.get("subject")), ("🔖 Topic", data.get("topic") or ("Whole subject" if upto >= 3 else None)),
+            ("🌐 Language", TEST_LANGUAGES.get(data.get("lang", ""), None)), ("🔢 Questions", data.get("count")), ("📊 Difficulty", None)]
+    lines = ["🧪 <b>Generate AI Test</b>", ""]
+    for i, (label, val) in enumerate(rows):
+        if i < upto and val:
+            lines.append(f"{label}: <b>{esc(val)}</b>")
+    return "\n".join(lines)
 
 
 async def aitest_max_questions(session: AsyncSession, user: User) -> int:
@@ -2142,34 +2250,61 @@ async def start_test_setup(message: Message, session: AsyncSession, user: User, 
     if not await aitest_available(message, session, user):
         return
     await state.clear()
-    await show_topic_step(message, session, state, edit=False)
+    await state.update_data(lang=user.language if user.language in TEST_LANGUAGES else "en")
+    await show_exam_step(message, session, user, state, edit=False)
 
 
-async def show_topic_step(message: Message, session: AsyncSession, state: FSMContext, *, edit: bool) -> None:
+async def _show(message: Message, text: str, kb: InlineKeyboardMarkup, edit: bool) -> None:
+    await (safe_edit(message, text, kb) if edit else message.answer(text, reply_markup=kb))
+
+
+async def show_exam_step(message: Message, session: AsyncSession, user: User, state: FSMContext, *, edit: bool) -> None:
     exams = list((await session.execute(select(Exam).where(Exam.active.is_(True)).order_by(Exam.name))).scalars())
-    await state.set_state(TestFlow.topic)
-    text = ("🧪 <b>Generate AI Test</b>\n\nStep 1/3 — Choose an exam or topic, or tap ✍️ Custom Topic to type your own "
-            "(e.g. <i>BPSC — Bihar History</i>, <i>Photosynthesis</i>).\n\n<i>AI practice questions are generated on the fly and are "
-            "not admin-verified exam questions.</i>")
-    await (safe_edit(message, text, topic_keyboard(exams)) if edit else message.answer(text, reply_markup=topic_keyboard(exams)))
+    if not exams:
+        await message.answer("No exams are configured yet. Please ask the admin."); await state.clear(); return
+    await state.set_state(TestFlow.exam)
+    data = await state.get_data()
+    await _show(message, setup_summary(data, 0) + "\nStep 1/6 — Choose the <b>examination</b>:", exam_step_keyboard(exams, data.get("exam_id") or user.selected_exam_id), edit)
+
+
+async def show_subject_step(message: Message, session: AsyncSession, user: User, state: FSMContext, *, edit: bool) -> None:
+    data = await state.get_data()
+    exam = await session.get(Exam, data.get("exam_id") or 0)
+    if not exam:
+        await show_exam_step(message, session, user, state, edit=edit); return
+    subjects = await exam_subjects(session, exam)
+    await state.update_data(subjects=subjects)
+    await state.set_state(TestFlow.subject)
+    await _show(message, setup_summary(data, 1) + "\n\nStep 2/6 — Choose the <b>subject</b>:", subject_step_keyboard(subjects), edit)
+
+
+async def show_topic_step(message: Message, state: FSMContext, *, edit: bool) -> None:
+    data = await state.get_data()
+    await state.set_state(TestFlow.custom_topic)
+    await _show(message, setup_summary(data, 2) + "\n\nStep 3/6 — Type a specific <b>topic / chapter / question area</b> "
+                "(e.g. <i>Grammar – Sandhi</i>, <i>Mughal Empire</i>, <i>Percentage</i>), or skip to cover the whole subject.", topic_step_keyboard(), edit)
+
+
+async def show_language_step(message: Message, state: FSMContext, *, edit: bool) -> None:
+    data = await state.get_data()
+    await state.set_state(TestFlow.language)
+    await _show(message, setup_summary(data, 3) + "\n\nStep 4/6 — Choose the <b>language of the questions</b>:", language_step_keyboard(data.get("lang", "en")), edit)
 
 
 async def show_count_step(message: Message, session: AsyncSession, user: User, state: FSMContext, *, edit: bool) -> None:
     data = await state.get_data(); await state.set_state(TestFlow.count)
     max_q = await aitest_max_questions(session, user)
-    text = f"🧪 <b>Generate AI Test</b>\n\nTopic: <b>{esc(data.get('topic'))}</b>\n\nStep 2/3 — How many questions? (1–{max_q} on your plan)"
-    await (safe_edit(message, text, count_keyboard(max_q)) if edit else message.answer(text, reply_markup=count_keyboard(max_q)))
+    await _show(message, setup_summary(data, 4) + f"\n\nStep 5/6 — <b>How many questions?</b> (1–{max_q} on your plan)", count_keyboard(max_q), edit)
 
 
 async def show_difficulty_step(message: Message, state: FSMContext, *, edit: bool) -> None:
     data = await state.get_data(); await state.set_state(TestFlow.difficulty)
-    lang = data.get("lang", "en")
-    text = (f"🧪 <b>Generate AI Test</b>\n\nTopic: <b>{esc(data.get('topic'))}</b>\nQuestions: <b>{data.get('count')}</b>\n"
-            f"Language: <b>{'हिन्दी' if lang == 'hi' else 'English'}</b>\n\nStep 3/3 — Pick a difficulty to start generating.")
-    await (safe_edit(message, text, difficulty_keyboard(lang)) if edit else message.answer(text, reply_markup=difficulty_keyboard(lang)))
+    await _show(message, setup_summary(data, 5) + "\n\nStep 6/6 — Pick a <b>difficulty</b> to start generating.", difficulty_keyboard(), edit)
 
 
 GENERATING_USERS: set[int] = set()
+SETUP_STATES = {TestFlow.exam.state, TestFlow.subject.state, TestFlow.custom_topic.state, TestFlow.language.state,
+                TestFlow.count.state, TestFlow.custom_count.state, TestFlow.difficulty.state}
 
 
 @router.callback_query(F.data.startswith("gt:"))
@@ -2187,47 +2322,62 @@ async def test_setup_callback(cb: CallbackQuery, session: AsyncSession, db_user:
             await finalize_test(session, test, await load_test_questions(session, test), status="abandoned")
         await cb.answer("Abandoned"); await safe_edit(cb.message, "🗑 Unfinished test abandoned.")
         await show_home(cb.message, db_user); return
-    current = await state.get_state()
-    if current not in (TestFlow.topic.state, TestFlow.count.state, TestFlow.difficulty.state, TestFlow.custom_topic.state, TestFlow.custom_count.state):
+    if (await state.get_state()) not in SETUP_STATES:
         await cb.answer("This setup screen has expired. Start again from 🧪 Generate AI Test.", show_alert=True); return
-    if action == "t" and arg.isdigit() and int(arg) < len(COMMON_TEST_TOPICS):
-        await state.update_data(topic=COMMON_TEST_TOPICS[int(arg)]); await cb.answer()
-        await show_count_step(cb.message, session, db_user, state, edit=True); return
+    data = await state.get_data()
+    # --- forward steps ---
     if action == "e":
         exam = await session.get(Exam, parse_int(arg, 0) or 0)
-        if not exam: await cb.answer("Exam not found.", show_alert=True); return
-        await state.update_data(topic=exam.name); await cb.answer()
-        await show_count_step(cb.message, session, db_user, state, edit=True); return
+        if not exam or not exam.active: await cb.answer("Exam not found.", show_alert=True); return
+        await state.update_data(exam_id=exam.id, exam_name=exam.name, subject=None, topic=None); await cb.answer()
+        await show_subject_step(cb.message, session, db_user, state, edit=True); return
+    if action == "s":
+        subjects = data.get("subjects") or []; i = parse_int(arg, -1)
+        if not (0 <= i < len(subjects)): await cb.answer("This list has changed — choose again.", show_alert=True); return
+        await state.update_data(subject=subjects[i], topic=None); await cb.answer()
+        await show_topic_step(cb.message, state, edit=True); return
     if action == "c":
         await state.set_state(TestFlow.custom_topic); await cb.answer()
-        await safe_edit(cb.message, "✍️ Type your topic (3–120 characters). Send /cancel to stop.", inline([[("❌ Cancel", "gt:x")]])); return
-    if action == "bt":
-        await cb.answer(); await show_topic_step(cb.message, session, state, edit=True); return
+        await safe_edit(cb.message, setup_summary(data, 1) + "\n\n✍️ Type your <b>custom subject or topic</b> (3–120 characters), e.g. <i>Hindi Grammar – Samas</i>. /cancel to stop.",
+                        inline([[("⬅️ Back", "gt:bs"), ("❌ Cancel", "gt:x")]]))
+        await state.update_data(subject=None); return
+    if action == "skipc":
+        await state.update_data(topic=None); await cb.answer()
+        await show_language_step(cb.message, state, edit=True); return
+    if action == "l" and arg in TEST_LANGUAGES:
+        await state.update_data(lang=arg); await cb.answer()
+        await show_count_step(cb.message, session, db_user, state, edit=True); return
     if action == "n" and arg.isdigit():
         n = int(arg); max_q = await aitest_max_questions(session, db_user)
-        if not (AI_TEST_MIN <= n <= max_q):
-            await cb.answer(f"Choose between {AI_TEST_MIN} and {max_q}.", show_alert=True); return
+        if not (AI_TEST_MIN <= n <= max_q): await cb.answer(f"Choose between {AI_TEST_MIN} and {max_q}.", show_alert=True); return
         await state.update_data(count=n); await cb.answer(); await show_difficulty_step(cb.message, state, edit=True); return
     if action == "nc":
         await state.set_state(TestFlow.custom_count); await cb.answer()
-        await safe_edit(cb.message, f"🔢 Send a number between {AI_TEST_MIN} and {await aitest_max_questions(session, db_user)}.", inline([[("⬅️ Back", "gt:bn"), ("❌ Cancel", "gt:x")]])); return
-    if action == "bn":
-        await cb.answer(); await show_count_step(cb.message, session, db_user, state, edit=True); return
-    if action == "l" and arg in ("en", "hi"):
-        await state.update_data(lang=arg); await cb.answer(); await show_difficulty_step(cb.message, state, edit=True); return
+        await safe_edit(cb.message, setup_summary(data, 4) + f"\n\n🔢 Send a number between {AI_TEST_MIN} and {await aitest_max_questions(session, db_user)}.",
+                        inline([[("⬅️ Back", "gt:bl"), ("❌ Cancel", "gt:x")]])); return
     if action == "d" and arg in AI_TEST_DIFFICULTIES:
         await cb.answer(); await run_generation(cb.message, session, db_user, state, arg, bot); return
+    # --- back navigation ---
+    if action == "be": await cb.answer(); await show_exam_step(cb.message, session, db_user, state, edit=True); return
+    if action == "bs": await cb.answer(); await show_subject_step(cb.message, session, db_user, state, edit=True); return
+    if action == "bc": await cb.answer(); await show_topic_step(cb.message, state, edit=True); return
+    if action == "bl": await cb.answer(); await show_language_step(cb.message, state, edit=True); return
+    if action == "bn": await cb.answer(); await show_count_step(cb.message, session, db_user, state, edit=True); return
     await cb.answer("Unknown action.", show_alert=True)
 
 
 @router.message(TestFlow.custom_topic, F.text)
 async def custom_topic_input(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
-    topic = re.sub(r"\s+", " ", message.text or "").strip()
     if _is_cmd(message): raise SkipHandler
+    topic = re.sub(r"\s+", " ", message.text or "").strip()
     if not (3 <= len(topic) <= 120):
         await message.answer("Please send a topic between 3 and 120 characters."); return
-    await state.update_data(topic=topic)
-    await show_count_step(message, session, db_user, state, edit=False)
+    data = await state.get_data()
+    if data.get("subject"):
+        await state.update_data(topic=topic)             # subject chosen from the list, this is the topic
+    else:
+        await state.update_data(subject=topic, topic=None)  # custom subject typed instead of picking one
+    await show_language_step(message, state, edit=False)
 
 
 @router.message(TestFlow.custom_count, F.text)
@@ -2240,10 +2390,15 @@ async def custom_count_input(message: Message, session: AsyncSession, db_user: U
     await show_difficulty_step(message, state, edit=False)
 
 
+def test_label(exam: str, subject: str, topic: str | None) -> str:
+    return " · ".join(x for x in (exam, subject, topic) if x)[:200]
+
+
 async def run_generation(message: Message, session: AsyncSession, user: User, state: FSMContext, difficulty: str, bot: Bot) -> None:
     data = await state.get_data()
-    topic, count, lang = str(data.get("topic") or ""), int(data.get("count") or 0), str(data.get("lang") or "en")
-    if not topic or not count:
+    exam, subject, topic = str(data.get("exam_name") or ""), str(data.get("subject") or ""), (data.get("topic") or None)
+    count, lang = int(data.get("count") or 0), str(data.get("lang") or "en")
+    if not exam or not subject or not count or lang not in TEST_LANGUAGES:
         await state.clear(); await message.answer("Setup data was lost. Please start again from 🧪 Generate AI Test."); return
     if user.id in GENERATING_USERS:
         await message.answer("⏳ Your previous test is still being generated. Please wait."); return
@@ -2251,17 +2406,19 @@ async def run_generation(message: Message, session: AsyncSession, user: User, st
     if not ok:
         await state.clear(); await send_html(message, why); return
     api_key = await current_api_key(session)
+    label = test_label(exam, subject, topic)
     await state.set_state(TestFlow.generating)
     GENERATING_USERS.add(user.id)
-    progress_msg = await safe_edit(message, f"⚙️ Generating <b>{count}</b> {difficulty} questions on <b>{esc(topic)}</b>…\n\n0/{count} ready")
+    head = f"⚙️ Generating <b>{count}</b> {difficulty} questions\n{esc(label)} · {TEST_LANGUAGES[lang]}\n\n"
+    progress_msg = await safe_edit(message, head + f"0/{count} ready")
     await session.commit()
     last = [0.0]
     async def progress(done: int, total: int) -> None:
         if time.monotonic() - last[0] > 2.5:
             last[0] = time.monotonic()
-            await safe_edit(progress_msg, f"⚙️ Generating <b>{total}</b> {difficulty} questions on <b>{esc(topic)}</b>…\n\n{done}/{total} ready")
+            await safe_edit(progress_msg, head + f"{done}/{total} ready")
     try:
-        questions, err = await generate_test_questions(topic, count, difficulty, lang, api_key, progress)
+        questions, err = await generate_test_questions(exam, subject, topic, count, difficulty, lang, api_key, progress)
     finally:
         GENERATING_USERS.discard(user.id)
         await state.clear()
@@ -2270,16 +2427,16 @@ async def run_generation(message: Message, session: AsyncSession, user: User, st
         return
     if err:
         txt = GENERATION_ERROR_TEXT.get(err) or AI_ERROR_TEXT.get(err) or AI_ERROR_TEXT["http"]
-        if questions and err == "incomplete" and len(questions) >= max(AI_TEST_MIN, count // 2):
-            await safe_edit(progress_msg, f"⚠️ Only {len(questions)} of {count} questions passed validation.",
+        if questions and err in ("incomplete", "language") and len(questions) >= max(AI_TEST_MIN, count // 2):
+            await state.update_data(partial={"label": label, "difficulty": difficulty, "lang": lang, "questions": questions, "requested": count})
+            await safe_edit(progress_msg, f"⚠️ Only {len(questions)} of {count} questions matched the selected subject and language after validation.",
                             inline([[("▶️ Start with these", f"gs:{len(questions)}")], [("🔄 Try again", "gt:new")], [("🏠 Home", "menu:home")]]))
-            await state.update_data(partial={"topic": topic, "difficulty": difficulty, "lang": lang, "questions": questions, "requested": count})
             return
         await safe_edit(progress_msg, txt, inline([[("🔄 Try again", "gt:new")], [("🏠 Home", "menu:home")]])); return
     await record_usage(session, user, "aitest")
-    test = await create_test_session(session, user, kind="ai", topic=topic, questions=questions, mode="practice",
+    test = await create_test_session(session, user, kind="ai", topic=label, questions=questions, mode="practice",
                                      difficulty=difficulty, lang=lang, requested=count)
-    await audit(session, user.telegram_id, "aitest.create", str(test.id), f"{topic} x{count}")
+    await audit(session, user.telegram_id, "aitest.create", str(test.id), f"{label} [{lang}] x{count}")
     await try_delete(progress_msg)
     await begin_test_ui(bot, session, message, test)
 
@@ -2291,7 +2448,7 @@ async def start_partial_test(cb: CallbackQuery, session: AsyncSession, db_user: 
         await cb.answer("These questions have expired. Generate again.", show_alert=True); return
     await state.clear(); await cb.answer()
     await record_usage(session, db_user, "aitest")
-    test = await create_test_session(session, db_user, kind="ai", topic=data["topic"], questions=data["questions"], mode="practice",
+    test = await create_test_session(session, db_user, kind="ai", topic=data["label"], questions=data["questions"], mode="practice",
                                      difficulty=data["difficulty"], lang=data["lang"], requested=data["requested"])
     await try_delete(cb.message)
     await begin_test_ui(bot, session, cb.message, test)
@@ -2301,20 +2458,30 @@ async def start_partial_test(cb: CallbackQuery, session: AsyncSession, db_user: 
 async def list_mock_tests(message: Message, session: AsyncSession, user: User, *, edit: bool = False) -> None:
     if not await feature_enabled(session, "mock"):
         await message.answer("📝 Mock tests are temporarily disabled by the administrator."); return
+    exams = list((await session.execute(select(Exam).where(Exam.active.is_(True)).order_by(Exam.name))).scalars())
     if not user.selected_exam_id:
-        await message.answer("Select your exam first."); await show_exams(message, session); return
+        rows = [[(e.name, f"mock:exam:{e.id}")] for e in exams] + [[("🏠 Home", "menu:home")]]
+        await _show(message, "📝 <b>Mock Tests</b>\n\nChoose the examination:", inline(rows), edit); return
+    exam = await session.get(Exam, user.selected_exam_id)
     tests = list((await session.execute(select(MockTest).where(MockTest.exam_id == user.selected_exam_id, MockTest.published.is_(True)).order_by(MockTest.id.desc()))).scalars())
-    if not tests:
-        await message.answer("No mock tests have been published for your exam yet."); return
-    rows = [[(f"{t.title} · {t.duration} min", f"mockinfo:{t.id}")] for t in tests] + [[("🏠 Home", "menu:home")]]
-    text = "📝 <b>Mock Tests</b> — admin-verified question sets. Choose one:"
+    rows = [[(f"{t.title} · {t.duration} min", f"mockinfo:{t.id}")] for t in tests]
+    rows += [[("🎯 Change exam", "mock:pick")], [("🏠 Home", "menu:home")]]
+    text = f"📝 <b>Mock Tests — {esc(exam.name if exam else '')}</b>\nAdmin-verified question sets." + ("\n\nNo mock tests published for this exam yet." if not tests else "\nChoose one:")
     await (safe_edit(message, text, inline(rows)) if edit else message.answer(text, reply_markup=inline(rows)))
 
 
-@router.callback_query(F.data == "mock:list")
+@router.callback_query(F.data.startswith("mock:"))
 async def mock_list_cb(cb: CallbackQuery, session: AsyncSession, db_user: User, bot: Bot):
     if not await gate(cb, db_user, session, bot): return
-    await cb.answer(); await list_mock_tests(cb.message, session, db_user)
+    parts = cb.data.split(":")
+    if parts[1] == "pick":
+        exams = list((await session.execute(select(Exam).where(Exam.active.is_(True)).order_by(Exam.name))).scalars())
+        await cb.answer(); await safe_edit(cb.message, "📝 <b>Mock Tests</b>\n\nChoose the examination:", inline([[(e.name, f"mock:exam:{e.id}")] for e in exams] + [[("🏠 Home", "menu:home")]])); return
+    if parts[1] == "exam":
+        exam = await session.get(Exam, parse_int(parts[2], 0) or 0) if len(parts) > 2 else None
+        if not exam or not exam.active: await cb.answer("Exam not found.", show_alert=True); return
+        db_user.selected_exam_id = exam.id; await session.flush()
+    await cb.answer(); await list_mock_tests(cb.message, session, db_user, edit=True)
 
 
 async def mock_servable_questions(session: AsyncSession, test_id: int) -> list[Question]:
@@ -2962,11 +3129,6 @@ async def cancel_cmd(message: Message, db_user: User, state: FSMContext):
     cur = await state.get_state()
     if cur and cur.startswith("PaymentFlow"):
         await message.answer("A payment is in progress. Use /cancel_payment to abort it, or continue sending the requested details."); return
-    data = await state.get_data()
-    restore_path = data.get("db_restore_path")
-    if restore_path:
-        try: os.remove(restore_path)
-        except OSError: pass
     await state.clear()
     await show_home(message, db_user, "✅ Cancelled.")
 
@@ -3085,49 +3247,6 @@ async def download_image(bot: Bot, file_id: str, size: int | None) -> bytes | No
     return data if len(data) <= MAX_IMAGE_BYTES else None
 
 
-@router.message(AdminFlow.db_restore_upload, F.document)
-@admin_only
-async def admin_db_restore_upload(message: Message, state: FSMContext, bot: Bot, db_user: User, **_):
-    doc = message.document
-    if not doc or not doc.file_name:
-        await message.answer("Please upload the backup as a named document file."); return
-    expected_ext = ".sql" if IS_SQLITE else ".json"
-    if not doc.file_name.lower().endswith(expected_ext):
-        await message.answer(f"This database expects a {expected_ext} backup. No data was changed."); return
-    if doc.file_size is None or doc.file_size <= 0 or doc.file_size > MAX_DB_BACKUP_BYTES:
-        await message.answer(f"Backup file must be between 1 byte and {MAX_DB_BACKUP_BYTES // (1024*1024)} MB."); return
-    try:
-        tg_file = await bot.get_file(doc.file_id)
-        buf = io.BytesIO()
-        await bot.download_file(tg_file.file_path, buf)
-        raw = buf.getvalue()
-        if not raw or len(raw) > MAX_DB_BACKUP_BYTES:
-            await message.answer("Backup size is invalid. No data was changed."); return
-        # Quick format-only validation before asking for confirmation; actual restore validates again.
-        if IS_SQLITE:
-            _sqlite_validate_dump(raw.decode("utf-8-sig"))
-        else:
-            payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict) or payload.get("format") != "examyatra-db-backup" or payload.get("version") != 1 or payload.get("dialect") != "postgresql":
-                raise ValueError("Unsupported backup format.")
-        suffix = ".sql" if IS_SQLITE else ".json"
-        fd, path = tempfile.mkstemp(prefix="examyatra_upload_", suffix=suffix)
-        with os.fdopen(fd, "wb") as f: f.write(raw)
-        await state.update_data(db_restore_path=path, db_restore_name=doc.file_name)
-        await state.set_state(AdminFlow.db_restore_upload)
-        await message.answer("⚠️ <b>Backup file validated for format.</b>\n\nRestoring will replace database records with the uploaded backup. Current records, subscriptions, question history, and usage records may be replaced by the backup contents. A safety backup will be sent to you first.\n\nConfirm only if you are sure.", reply_markup=inline([[ ("⚠️ Confirm Restore", "adm:dbconfirm") ], [ ("❌ Cancel", "adm:dbcancel") ]]))
-    except Exception as e:
-        log.warning("Rejected database backup upload from admin %s: %s", message.from_user.id, type(e).__name__)
-        await message.answer(f"❌ Backup rejected: {esc(str(e)[:220])}. No database records were changed.")
-
-
-@router.message(AdminFlow.db_restore_upload)
-@admin_only
-async def admin_db_restore_wrong_upload(message: Message, state: FSMContext, db_user: User, **_):
-    if _is_cmd(message): raise SkipHandler
-    await message.answer("Please upload the backup file as a document, or use /cancel to abort.")
-
-
 @router.message(StateFilter(None), F.photo)
 async def photo_question(message: Message, session: AsyncSession, db_user: User, bot: Bot):
     if not await gate(message, db_user, session, bot): return
@@ -3182,163 +3301,6 @@ def admin_only(fn):
     return wrapper
 
 
-# ============================ Manual database backup / restore ============================
-def _sqlite_db_path() -> str:
-    url = make_url(DATABASE_URL)
-    if url.database in (None, "", ":memory:"):
-        raise RuntimeError("SQLite in-memory databases cannot be safely restored on this deployment.")
-    path = Path(url.database)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return str(path.resolve())
-
-
-def _encode_db_value(value: Any) -> Any:
-    if isinstance(value, datetime):
-        return {"__ey_type__": "datetime", "value": value.isoformat()}
-    if isinstance(value, date):
-        return {"__ey_type__": "date", "value": value.isoformat()}
-    if isinstance(value, Decimal):
-        return {"__ey_type__": "decimal", "value": str(value)}
-    if isinstance(value, (bytes, bytearray, memoryview)):
-        return {"__ey_type__": "bytes", "value": base64.b64encode(bytes(value)).decode("ascii")}
-    return value
-
-
-def _decode_db_value(value: Any) -> Any:
-    if not isinstance(value, dict) or "__ey_type__" not in value:
-        return value
-    typ, raw = value.get("__ey_type__"), value.get("value")
-    if typ == "datetime": return datetime.fromisoformat(raw)
-    if typ == "date": return date.fromisoformat(raw)
-    if typ == "decimal": return Decimal(raw)
-    if typ == "bytes": return base64.b64decode(raw, validate=True)
-    raise ValueError("Unsupported typed value in backup.")
-
-
-async def create_database_backup() -> tuple[bytes, str, str]:
-    """Create a manual, point-in-time backup. SQLite uses native SQL dump; PostgreSQL uses a typed logical JSON snapshot."""
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_UTC")
-    if IS_SQLITE:
-        db_path = _sqlite_db_path()
-        if not os.path.isfile(db_path):
-            raise RuntimeError("SQLite database file was not found. The database may not have been initialized yet.")
-        # SQLite's iterdump runs against one read transaction, giving a consistent SQL dump.
-        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=15) as con:
-            con.execute("BEGIN")
-            sql_text = "\n".join(con.iterdump()) + "\n"
-        return sql_text.encode("utf-8"), f"examyatra_backup_{stamp}.sql", "sqlite"
-
-    def dump_sync(sync_conn):
-        metadata = sa_inspect(sync_conn).get_table_names()
-        md = __import__("sqlalchemy").MetaData()
-        md.reflect(bind=sync_conn, only=metadata)
-        tables = {}
-        for table in md.sorted_tables:
-            rows = sync_conn.execute(table.select()).mappings().all()
-            tables[table.name] = [{k: _encode_db_value(v) for k, v in row.items()} for row in rows]
-        return {"format": "examyatra-db-backup", "version": 1, "created_at": datetime.now(timezone.utc).isoformat(), "dialect": "postgresql", "tables": tables}
-    async with engine.connect() as conn:
-        payload = await conn.run_sync(dump_sync)
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), f"examyatra_backup_{stamp}.eydb.json", "postgresql"
-
-
-def _sqlite_validate_dump(sql_text: str) -> None:
-    if not sql_text.strip() or len(sql_text) > MAX_DB_BACKUP_BYTES:
-        raise ValueError("Backup is empty or exceeds the configured size limit.")
-    statements, pending = [], ""
-    for line in sql_text.splitlines():
-        pending += line + "\n"
-        if sqlite3.complete_statement(pending):
-            statement = pending.strip(); pending = ""
-            if statement: statements.append(statement)
-    if pending.strip():
-        raise ValueError("SQL backup appears truncated or has an incomplete statement.")
-    if not statements:
-        raise ValueError("No SQL statements found.")
-    allowed_prefixes = ("CREATE TABLE ", "CREATE INDEX ", "CREATE UNIQUE INDEX ", "INSERT INTO ", "BEGIN TRANSACTION", "COMMIT", "PRAGMA FOREIGN_KEYS=OFF", "PRAGMA FOREIGN_KEYS=ON", 'DELETE FROM "SQLITE_SEQUENCE"')
-    for statement in statements:
-        upper = statement.upper().lstrip()
-        if not upper.startswith(allowed_prefixes):
-            raise ValueError("Backup contains an unsupported SQL statement; restore was blocked for safety.")
-
-
-def _validate_sqlite_db(path: str) -> None:
-    with sqlite3.connect(path) as con:
-        integrity = con.execute("PRAGMA integrity_check").fetchone()
-        if not integrity or integrity[0] != "ok":
-            raise ValueError("The uploaded backup failed SQLite integrity validation.")
-        names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        required = {"users", "questions", "exams", "settings"}
-        if not required.issubset(names):
-            raise ValueError("Backup is missing required Exam Yatra tables; restore was blocked.")
-
-
-async def restore_sqlite_backup(sql_bytes: bytes) -> None:
-    sql_text = sql_bytes.decode("utf-8-sig")
-    _sqlite_validate_dump(sql_text)
-    current_path = _sqlite_db_path()
-    parent = os.path.dirname(current_path) or "."
-    os.makedirs(parent, exist_ok=True)
-    fd, temp_path = tempfile.mkstemp(prefix="examyatra_restore_", suffix=".db", dir=parent)
-    os.close(fd)
-    try:
-        with sqlite3.connect(temp_path) as temp_db:
-            temp_db.execute("PRAGMA foreign_keys=OFF")
-            temp_db.executescript(sql_text)
-            temp_db.commit()
-        _validate_sqlite_db(temp_path)
-        # Safety backup is already delivered to the admin before this function is called.
-        await engine.dispose()
-        os.replace(temp_path, current_path)
-        await engine.dispose()  # fresh connections will open the restored file
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
-async def restore_postgres_backup(raw: bytes) -> None:
-    payload = json.loads(raw.decode("utf-8"))
-    if not isinstance(payload, dict) or payload.get("format") != "examyatra-db-backup" or payload.get("version") != 1 or payload.get("dialect") != "postgresql" or not isinstance(payload.get("tables"), dict):
-        raise ValueError("This is not a supported Exam Yatra PostgreSQL backup.")
-    tables_data = payload["tables"]
-    if not tables_data or len(tables_data) > 100:
-        raise ValueError("Backup table list is invalid.")
-    def restore_sync(sync_conn):
-        md = __import__("sqlalchemy").MetaData()
-        md.reflect(bind=sync_conn)
-        expected = {t.name for t in md.sorted_tables}
-        if set(tables_data) != expected:
-            raise ValueError("Backup schema does not match the current database. No records were changed.")
-        required = {"users", "questions", "exams", "settings"}
-        if not required.issubset(expected):
-            raise ValueError("Current database schema is missing required Exam Yatra tables.")
-        # Transaction is managed by engine.begin(); any insert/delete failure rolls the full restore back.
-        for table in reversed(md.sorted_tables):
-            sync_conn.execute(table.delete())
-        for table in md.sorted_tables:
-            rows = tables_data.get(table.name)
-            if not isinstance(rows, list):
-                raise ValueError(f"Invalid rows for table {table.name}.")
-            allowed_cols = {c.name for c in table.columns}
-            prepared = []
-            for row in rows:
-                if not isinstance(row, dict) or not set(row).issubset(allowed_cols):
-                    raise ValueError(f"Invalid columns in table {table.name}.")
-                prepared.append({k: _decode_db_value(v) for k, v in row.items()})
-            if prepared:
-                sync_conn.execute(table.insert(), prepared)
-        # Reset PostgreSQL identity/serial sequences so new records do not collide with restored IDs.
-        for table in md.sorted_tables:
-            for col in table.columns:
-                if col.primary_key and getattr(col.type, "python_type", None) is int:
-                    sync_conn.execute(sa_text("SELECT setval(pg_get_serial_sequence(:tbl, :col), COALESCE((SELECT MAX(" + '"' + col.name + '"' + ") FROM \"" + table.name + "\"), 1), (SELECT COUNT(*) > 0 FROM \"" + table.name + "\"))"), {"tbl": table.name, "col": col.name})
-    async with engine.begin() as conn:
-        await conn.run_sync(restore_sync)
-
-
 def admin_keyboard() -> InlineKeyboardMarkup:
     return inline([
         [("📊 Dashboard", "adm:dash"), ("👥 Users", "adm:users")],
@@ -3349,8 +3311,7 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [("⚙️ Features", "adm:feat"), ("📣 Broadcast", "adm:bc")],
         [("🛠 Maintenance", "adm:maint"), ("📨 Support contact", "adm:support")],
         [("➕ Exam", "adm:addexam"), ("📝 Mock tests", "adm:mock")],
-        [("🗄️ Database Backup / Restore", "adm:db")],
-        [("📜 Audit log", "adm:audit:0")],
+        [("📜 Audit log", "adm:audit:0"), ("🗄️ Backup / Restore", "adm:db")],
     ])
 
 
@@ -3525,7 +3486,7 @@ async def qb_screen(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
             "\n\nOnly <b>approved</b> questions are served in Daily Quiz and Mock Tests. Legacy questions were imported as <i>pending</i> and need review.")
     rows = [[("🕒 Review pending", "adm:qr:pending:0"), ("✅ Approved", "adm:qr:approved:0"), ("❌ Rejected", "adm:qr:rejected:0")],
             [("➕ Add question", "adm:addq"), ("🔎 Search / open by ID", "adm:qsearch")],
-            [("👯 Find duplicates", "adm:qdups")]]
+            [("👯 Find duplicates", "adm:qdups"), ("🧪 Test subjects per exam", "adm:tsub")]]
     rows += [[(f"📂 {e.name}", f"adm:qexam:{e.id}:0")] for e in exams[:12]]
     rows.append(BACK_ADMIN)
     return text, inline(rows)
@@ -3587,6 +3548,7 @@ SETTING_PROMPTS = {
     "plan_validity_days": "Send validity in days (e.g. 30). Send 0 for lifetime access.", "upi_id": "Send the UPI ID, e.g. name@bank.",
     "upi_payee": "Send the payee name shown in UPI apps.", "trial_days": "Send trial length in days (0 disables trials for new users).",
     "material_subjects": "Send the subject list separated by | (used as the preferred order), e.g. General Knowledge|Indian History|Science.",
+    "backup_max_mb": "Send the maximum accepted restore-file size in MB (1–20; Telegram cannot download larger files).",
     "maintenance_message": "Send the maintenance message users will see.", "support_contact": "Send the support contact: @username or https://t.me/... link.",
 }
 
@@ -3598,6 +3560,10 @@ async def apply_setting(session: AsyncSession, key: str, raw: str) -> str | None
         except ValueError: return "Price must be a number."
         if v <= 0 or v > 100000: return "Price out of range."
         await set_setting(session, key, f"{v:.2f}"); return None
+    if key == "backup_max_mb":
+        v = parse_int(raw, None)
+        if v is None or not (1 <= v <= 20): return "Send a whole number between 1 and 20."
+        await set_setting(session, key, str(v)); return None
     if key in ("plan_validity_days", "trial_days"):
         v = parse_int(raw, None)
         if v is None or v < 0 or v > 3650: return "Send a whole number of days (0–3650)."
@@ -3632,87 +3598,6 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
         await cb.answer(); await state.clear(); await edit("🛠 <b>Exam Yatra Admin Panel</b>", admin_keyboard()); return
     if action == "dash":
         await cb.answer(); await edit(await dashboard_text(session), inline([[("🔄 Refresh", "adm:dash")], BACK_ADMIN])); return
-    if action == "db":
-        await cb.answer()
-        await edit("🗄️ <b>Database Backup / Restore</b>\n\n• No scheduled or background backups are created.\n• Manual backup sends a file to this admin chat.\n• Restore requires a compatible backup upload and confirmation.\n• A one-time safety backup is sent to you immediately before a confirmed restore.", inline([
-            [("🗄️ Backup Database", "adm:dbbackup")],
-            [("♻️ Restore Database", "adm:dbrestore")], BACK_ADMIN]))
-        return
-    if action == "dbbackup":
-        await cb.answer("Creating backup…")
-        if DB_BACKUP_LOCK.locked():
-            await msg.answer("⏳ A database backup/restore operation is already running. Try again shortly."); return
-        async with DB_BACKUP_LOCK:
-            try:
-                content, filename, dialect = await create_database_backup()
-                if len(content) > MAX_DB_BACKUP_BYTES:
-                    raise ValueError(f"Backup exceeds the configured {MAX_DB_BACKUP_BYTES // (1024*1024)} MB limit.")
-                await bot.send_document(actor, BufferedInputFile(content, filename=filename), caption=f"🗄️ Manual database backup\nDatabase: {dialect}\nCreated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\nNo scheduled backups are enabled.")
-                await audit(session, actor, "db.backup.success", filename, f"dialect={dialect}; bytes={len(content)}")
-                await session.commit()
-                await msg.answer(f"✅ Backup created and sent to your private admin chat.\nFile: <code>{esc(filename)}</code>")
-            except Exception as e:
-                log.exception("Manual database backup failed")
-                await audit(session, actor, "db.backup.failed", details=type(e).__name__)
-                await session.commit()
-                await msg.answer(f"❌ Backup failed: {esc(type(e).__name__)}. Check server logs; database credentials are not shown.")
-        return
-    if action == "dbrestore":
-        await state.set_state(AdminFlow.db_restore_upload)
-        await cb.answer()
-        ext = ".sql" if IS_SQLITE else ".eydb.json"
-        await msg.answer(f"♻️ <b>Restore database</b>\nUpload a compatible Exam Yatra backup file ({ext}).\n\nThe current database will not be changed yet. After validation, you must confirm. A safety backup will be sent to you immediately before restore.\n\n/cancel to abort.")
-        return
-    if action == "dbconfirm":
-        data = await state.get_data()
-        path = data.get("db_restore_path")
-        if not path or not os.path.isfile(path):
-            await state.clear(); await cb.answer("Backup upload expired. Upload it again.", show_alert=True); return
-        if DB_BACKUP_LOCK.locked():
-            await cb.answer("Another database operation is running.", show_alert=True); return
-        await cb.answer("Validating and restoring…")
-        async with DB_BACKUP_LOCK:
-            safety_path = None
-            try:
-                raw = Path(path).read_bytes()
-                if not raw or len(raw) > MAX_DB_BACKUP_BYTES:
-                    raise ValueError("Backup is empty or exceeds the configured size limit.")
-                # Create and deliver a recovery copy before touching the current database.
-                safety_bytes, safety_name, dialect = await create_database_backup()
-                await bot.send_document(actor, BufferedInputFile(safety_bytes, filename=safety_name), caption="🛟 Automatic one-time safety backup made immediately before your manually confirmed restore. This is NOT a scheduled backup.")
-                if IS_SQLITE:
-                    if not path.lower().endswith(".sql"):
-                        raise ValueError("SQLite restore requires an .sql backup file.")
-                    await restore_sqlite_backup(raw)
-                else:
-                    if not path.lower().endswith((".json", ".eydb.json")):
-                        raise ValueError("PostgreSQL restore requires an Exam Yatra .json backup file.")
-                    await restore_postgres_backup(raw)
-                # Verify that the restored database is reachable and core tables exist.
-                async with engine.connect() as conn:
-                    tables = await conn.run_sync(lambda c: set(sa_inspect(c).get_table_names()))
-                if not {"users", "questions", "exams", "settings"}.issubset(tables):
-                    raise RuntimeError("Post-restore verification failed; required tables are missing.")
-                await audit(session, actor, "db.restore.success", os.path.basename(path), f"dialect={dialect}")
-                await session.commit()
-                await state.clear()
-                await msg.answer("✅ Database restore completed and core-table verification passed. The safety backup was sent to your private admin chat.", reply_markup=admin_keyboard())
-            except Exception as e:
-                log.exception("Database restore failed")
-                await audit(session, actor, "db.restore.failed", os.path.basename(path), type(e).__name__)
-                await session.commit()
-                await state.clear()
-                await msg.answer(f"❌ Restore failed: {esc(type(e).__name__)}. Check server logs. Do not delete the safety backup; use it for recovery if needed.", reply_markup=admin_keyboard())
-            finally:
-                try: os.remove(path)
-                except OSError: pass
-        return
-    if action == "dbcancel":
-        data = await state.get_data(); path = data.get("db_restore_path")
-        if path:
-            try: os.remove(path)
-            except OSError: pass
-        await state.clear(); await cb.answer("Restore cancelled."); await edit("🛠 <b>Exam Yatra Admin Panel</b>", admin_keyboard()); return
 
     # ----- users -----
     if action == "users":
@@ -3884,6 +3769,15 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
     if action == "qexam":
         ex = await session.get(Exam, parse_int(a2, 0) or 0); await cb.answer()
         text, kb = await question_list(session, Question.exam_id == (ex.id if ex else -1), parse_int(a3, 0) or 0, f"Questions — {ex.name if ex else '?'}", f"adm:qexam:{a2}"); await edit(text, kb); return
+    if action == "tsub":
+        if a2:
+            ex = await session.get(Exam, parse_int(a2, 0) or 0)
+            if not ex: await cb.answer("Exam not found.", show_alert=True); return
+            await state.set_state(AdminFlow.setting_value); await state.update_data(key=f"test_subjects:{ex.id}"); await cb.answer()
+            cur = await get_setting(session, f"test_subjects:{ex.id}", "") or "|".join(DEFAULT_TEST_SUBJECTS.get(ex.name, DEFAULT_TEST_SUBJECTS["_default"]))
+            await msg.answer(f"✏️ Send the subject list for <b>{esc(ex.name)}</b> separated by | (shown in this order in the AI Test setup).\nCurrent: <code>{esc(cur)}</code>\n/cancel to abort."); return
+        exams = list((await session.execute(select(Exam).where(Exam.active.is_(True)).order_by(Exam.name))).scalars())
+        await cb.answer(); await edit("🧪 <b>Test subjects per exam</b> — choose an exam to edit its subject list:", inline([[(e.name, f"adm:tsub:{e.id}")] for e in exams] + [[("⬅️ Question Bank", "adm:qb")]])); return
     if action == "qsearch":
         await state.set_state(AdminFlow.search_question); await cb.answer()
         await msg.answer("🔎 Send a question ID (e.g. <code>42</code>) or a search phrase. /cancel to abort."); return
@@ -4058,6 +3952,27 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
         await state.set_state(AdminFlow.mock_test); await state.update_data(step="attach", test_id=t.id); await cb.answer()
         await msg.answer(f"➕ Send approved question IDs to attach to <b>{esc(t.title)}</b>, separated by spaces or commas (e.g. <code>12 15 19</code>), "
                          "or <code>auto 20</code> to attach 20 random approved questions of this exam. /cancel when done."); return
+    # ----- database backup / restore -----
+    if action == "db":
+        await cb.answer(); await state.clear(); text, kb = await backup_screen(session); await edit(text, kb); return
+    if action == "backup":
+        if BACKUP_LOCK.locked(): await cb.answer("A backup or restore is already running.", show_alert=True); return
+        await cb.answer("Creating backup…")
+        async with BACKUP_LOCK:
+            await session.commit()
+            await run_backup(bot, session, msg.chat.id, actor)
+        text, kb = await backup_screen(session); await msg.answer(text, reply_markup=kb); return
+    if action == "restore":
+        if a2 == "go":
+            await perform_restore(cb, session, state, bot); return
+        if a2 == "cancel":
+            await state.clear(); await cb.answer("Cancelled"); text, kb = await backup_screen(session); await edit(text, kb); return
+        if BACKUP_LOCK.locked(): await cb.answer("A backup or restore is already running.", show_alert=True); return
+        await state.set_state(AdminFlow.restore_upload); await cb.answer()
+        max_mb = min(20, max(1, await setting_int(session, "backup_max_mb", BACKUP_MAX_MB_DEFAULT)))
+        await msg.answer("♻️ <b>Restore Database</b>\n\nUpload the portable backup file <code>examyatra-backup-….json</code> as a document "
+                         f"(max {max_mb} MB). It will be validated against this version's schema before anything is touched.\n\n"
+                         "⚠️ Restoring replaces existing records. You will get a confirmation step and a safety backup first. /cancel to abort."); return
     if action == "audit":
         page = parse_int(a2, 0) or 0; await cb.answer()
         rows = list((await session.execute(select(AuditLog).order_by(AuditLog.id.desc()).offset(page * 15).limit(15))).scalars())
@@ -4069,6 +3984,380 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
 @router.callback_query(F.data == "noop")
 async def noop(cb: CallbackQuery):
     await cb.answer()
+
+
+
+# ============================ Database backup & restore (admin) ============================
+# Two artefacts per backup:
+#   1. A portable application backup (JSON, every ORM table as rows, schema version stamped). This is the ONLY
+#      format Restore accepts — rows are validated column-by-column against the live models, so no SQL from an
+#      uploaded file is ever executed. Works across SQLite ⇄ PostgreSQL.
+#   2. A native dump for external disaster recovery: SQLite → .sql via sqlite3 iterdump() of a consistent
+#      online copy; PostgreSQL → pg_dump plain SQL when the binary exists on the host (Render's Python
+#      runtime usually lacks it, in which case only the portable backup is produced and the message says so).
+BACKUP_FORMAT = "examyatra-backup"
+BACKUP_SCHEMA_VERSION = 3
+BACKUP_LOCK = asyncio.Lock()
+BACKUP_MAX_MB_DEFAULT = 20          # Telegram Bot API cannot download files > 20 MB anyway
+ESSENTIAL_TABLES = ("users", "exams", "questions", "options", "settings", "ai_tests", "ai_test_questions", "payment_requests")
+_SQLITE_OK_PREFIXES = ("BEGIN TRANSACTION", "COMMIT", "CREATE TABLE", "CREATE INDEX", "CREATE UNIQUE INDEX", "INSERT INTO", "DELETE FROM \"sqlite_sequence\"")
+
+
+def _json_value(v: Any) -> Any:
+    if isinstance(v, datetime):
+        return v.isoformat()
+    if isinstance(v, date):
+        return v.isoformat()
+    return v
+
+
+def _py_value(col, v: Any) -> Any:
+    """Convert a JSON value back to the column's Python type; reject anything that doesn't fit."""
+    if v is None:
+        return None
+    try:
+        pt = col.type.python_type
+    except NotImplementedError:
+        return v
+    if pt is datetime:
+        if not isinstance(v, str): raise ValueError(f"{col.table.name}.{col.name}: datetime expected")
+        return datetime.fromisoformat(v).replace(tzinfo=None)
+    if pt is bool:
+        if isinstance(v, bool): return v
+        if v in (0, 1): return bool(v)
+        raise ValueError(f"{col.table.name}.{col.name}: boolean expected")
+    if pt is int:
+        if isinstance(v, bool) or not isinstance(v, int): raise ValueError(f"{col.table.name}.{col.name}: integer expected")
+        return v
+    if pt is float:
+        if isinstance(v, bool) or not isinstance(v, (int, float)): raise ValueError(f"{col.table.name}.{col.name}: number expected")
+        return float(v)
+    if pt is str:
+        if not isinstance(v, str): raise ValueError(f"{col.table.name}.{col.name}: text expected")
+        return v
+    return v
+
+
+async def export_portable_backup() -> tuple[bytes, dict[str, int]]:
+    """Read every table inside ONE transaction (repeatable snapshot on PostgreSQL; SQLite serialises writers)."""
+    counts: dict[str, int] = {}
+    payload: dict[str, Any] = {"format": BACKUP_FORMAT, "schema_version": BACKUP_SCHEMA_VERSION, "created_at": now_utc().isoformat(),
+                               "dialect": "sqlite" if IS_SQLITE else "postgresql", "app": "ExamYatra v3", "tables": {}}
+    async with engine.connect() as conn:
+        if not IS_SQLITE:
+            await conn.execute(sa_text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
+        for table in Base.metadata.sorted_tables:
+            rows = (await conn.execute(select(table))).mappings().all()
+            payload["tables"][table.name] = [{k: _json_value(v) for k, v in r.items()} for r in rows]
+            counts[table.name] = len(rows)
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), counts
+
+
+def validate_backup_payload(raw: bytes) -> tuple[dict[str, Any] | None, str]:
+    """Structural + type validation against the live models. Returns (payload, error)."""
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        return None, f"Not a valid JSON backup ({type(e).__name__})."
+    if not isinstance(data, dict) or data.get("format") != BACKUP_FORMAT:
+        return None, "This file is not an Exam Yatra portable backup (.json). Native .sql dumps must be restored with the sqlite3/psql tools — see README."
+    ver = data.get("schema_version")
+    if not isinstance(ver, int) or ver > BACKUP_SCHEMA_VERSION or ver < 1:
+        return None, f"Backup schema version {ver!r} is not supported by this bot (supports ≤ {BACKUP_SCHEMA_VERSION})."
+    tables = data.get("tables")
+    if not isinstance(tables, dict):
+        return None, "Backup has no tables section."
+    known = {t.name: t for t in Base.metadata.sorted_tables}
+    unknown = sorted(set(tables) - set(known))
+    if unknown:
+        return None, f"Backup contains tables this version does not know: {', '.join(unknown[:5])}."
+    missing = [t for t in ESSENTIAL_TABLES if t not in tables]
+    if missing:
+        return None, f"Backup is missing essential tables: {', '.join(missing)}."
+    for tname, rows in tables.items():
+        table = known[tname]
+        cols = {c.name: c for c in table.columns}
+        if not isinstance(rows, list):
+            return None, f"Table {tname}: rows must be a list."
+        for i, row in enumerate(rows):
+            if not isinstance(row, dict):
+                return None, f"Table {tname} row {i}: object expected."
+            extra = set(row) - set(cols)
+            if extra:
+                return None, f"Table {tname} row {i}: unknown columns {sorted(extra)[:3]}."
+            for cname, v in row.items():
+                try:
+                    _py_value(cols[cname], v)
+                except ValueError as e:
+                    return None, f"Table {tname} row {i}: {e}"
+            for c in table.primary_key.columns:
+                if row.get(c.name) is None:
+                    return None, f"Table {tname} row {i}: primary key {c.name} missing."
+    if not tables.get("users"):
+        return None, "Backup contains no users — refusing to restore an empty dataset."
+    return data, ""
+
+
+def _coerce_row(table, row: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for c in table.columns:
+        if c.name in row:
+            out[c.name] = _py_value(c, row[c.name])
+        elif c.default is not None and c.default.is_scalar:
+            out[c.name] = c.default.arg
+        elif c.server_default is not None:
+            sd = str(getattr(c.server_default, "arg", "")).strip("'")
+            out[c.name] = {"0": False, "1": True, "false": False, "true": True}.get(sd.lower(), sd) if sd != "" else None
+        else:
+            out[c.name] = None
+    return out
+
+
+async def restore_portable_backup(payload: dict[str, Any]) -> dict[str, int]:
+    """Replace all rows of every table inside ONE transaction. Any failure rolls back → original data untouched."""
+    tables = payload["tables"]
+    counts: dict[str, int] = {}
+    async with engine.begin() as conn:
+        if IS_SQLITE:
+            await conn.execute(sa_text("PRAGMA foreign_keys=OFF"))
+        else:
+            await conn.execute(sa_text("SET CONSTRAINTS ALL DEFERRED"))
+        for table in reversed(Base.metadata.sorted_tables):
+            await conn.execute(table.delete())
+        for table in Base.metadata.sorted_tables:
+            rows = [_coerce_row(table, r) for r in tables.get(table.name, [])]
+            for i in range(0, len(rows), 500):
+                await conn.execute(table.insert(), rows[i:i + 500])
+            counts[table.name] = len(rows)
+            if not IS_SQLITE:
+                for c in table.primary_key.columns:
+                    if c.autoincrement in (True, "auto") and c.type.python_type is int:
+                        await conn.execute(sa_text(
+                            f"SELECT setval(pg_get_serial_sequence('{table.name}', '{c.name}'), COALESCE((SELECT MAX({c.name}) FROM {table.name}), 1), "
+                            f"(SELECT MAX({c.name}) FROM {table.name}) IS NOT NULL)"))
+        # Verify inside the same transaction: every table must hold exactly the rows we wrote.
+        for table in Base.metadata.sorted_tables:
+            n = int((await conn.execute(select(func.count()).select_from(table))).scalar_one())
+            if n != counts[table.name]:
+                raise RuntimeError(f"verification failed for {table.name}: {n} rows present, {counts[table.name]} expected")
+        if IS_SQLITE:
+            bad = (await conn.execute(sa_text("PRAGMA foreign_key_check"))).all()
+            if bad:
+                raise RuntimeError(f"foreign-key check failed on {len(bad)} row(s), e.g. table {bad[0][0]}")
+    _SETTINGS_CACHE.clear()
+    return counts
+
+
+async def verify_database_access() -> list[str]:
+    """Post-restore sanity: essential tables exist and are readable. Returns a list of problems."""
+    problems: list[str] = []
+    try:
+        async with engine.connect() as conn:
+            def _tables(sync_conn): return set(sa_inspect(sync_conn).get_table_names())
+            present = await conn.run_sync(_tables)
+            for t in ESSENTIAL_TABLES:
+                if t not in present:
+                    problems.append(f"table {t} missing")
+            await conn.execute(select(func.count()).select_from(User.__table__))
+    except Exception as e:
+        problems.append(f"{type(e).__name__}: {str(e)[:120]}")
+    return problems
+
+
+def _sqlite_path() -> str:
+    return DATABASE_URL.split("///", 1)[1].split("?", 1)[0]
+
+
+def _sqlite_native_dump_sync() -> bytes:
+    """Consistent online copy via the sqlite3 backup API, then a SQL dump of the copy."""
+    import sqlite3, tempfile
+    src = sqlite3.connect(_sqlite_path())
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+            tmp_path = tmp.name
+        dst = sqlite3.connect(tmp_path)
+        try:
+            src.backup(dst)
+            lines = [f"-- ExamYatra SQLite dump {now_utc().isoformat()}Z", "PRAGMA foreign_keys=OFF;"]
+            lines += list(dst.iterdump())
+            return ("\n".join(lines) + "\n").encode("utf-8")
+        finally:
+            dst.close()
+            try: os.remove(tmp_path)
+            except OSError: pass
+    finally:
+        src.close()
+
+
+async def _postgres_native_dump() -> tuple[bytes | None, str]:
+    """pg_dump plain SQL. Credentials go through PGPASSWORD, never the command line or logs."""
+    from sqlalchemy.engine import make_url
+    url = make_url(DATABASE_URL)
+    cmd = ["pg_dump", "--format=plain", "--no-owner", "--no-privileges", "--inserts",
+           "-h", url.host or "localhost", "-p", str(url.port or 5432), "-U", url.username or "", "-d", url.database or ""]
+    env = {**os.environ, "PGPASSWORD": url.password or ""}
+    if "ssl" in (url.query or {}) or "sslmode" in (url.query or {}):
+        env["PGSSLMODE"] = "require"
+    try:
+        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
+    except FileNotFoundError:
+        return None, "pg_dump is not installed on this host — only the portable backup was created (it is fully restorable)."
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+    except asyncio.TimeoutError:
+        proc.kill(); return None, "pg_dump timed out after 180 s."
+    if proc.returncode != 0:
+        msg = re.sub(r"password[^\n]*", "password ***", err.decode("utf-8", "replace"))[:200]
+        return None, f"pg_dump failed: {msg}"
+    return out, ""
+
+
+async def run_backup(bot: Bot, session: AsyncSession, chat_id: int, actor: int, *, label: str = "manual") -> bool:
+    """Create both artefacts, send them to the admin chat, record status. Returns True on success."""
+    ts = datetime.now(IST).strftime("%Y%m%d-%H%M%S")
+    notes: list[str] = []
+    ok = False
+    try:
+        portable, counts = await export_portable_backup()
+        await bot.send_document(chat_id, BufferedInputFile(portable, filename=f"examyatra-backup-{ts}.json"),
+                                caption=(f"🗄️ <b>Portable backup</b> ({label}) — {len(portable) / 1024:.0f} KB\n"
+                                         f"Users {counts.get('users', 0)} · Questions {counts.get('questions', 0)} · Tests {counts.get('ai_tests', 0)} · "
+                                         f"Payments {counts.get('payment_requests', 0)} · Materials {counts.get('materials', 0)}\n"
+                                         "Use this file with ♻️ Restore Database. Store it outside the server."))
+        if IS_SQLITE:
+            native = await asyncio.to_thread(_sqlite_native_dump_sync)
+            await bot.send_document(chat_id, BufferedInputFile(native, filename=f"examyatra-sqlite-{ts}.sql"),
+                                    caption="🗄️ Native SQLite SQL dump (for manual recovery with the sqlite3 CLI).")
+        else:
+            native, err = await _postgres_native_dump()
+            if native:
+                if len(native) <= 49 * 1024 * 1024:
+                    await bot.send_document(chat_id, BufferedInputFile(native, filename=f"examyatra-postgres-{ts}.sql"),
+                                            caption="🗄️ Native PostgreSQL dump (pg_dump plain SQL, for manual recovery with psql).")
+                else:
+                    notes.append("pg_dump output exceeds Telegram's 50 MB upload limit; only the portable backup was sent.")
+            else:
+                notes.append(err)
+        ok = True
+    except TelegramAPIError as e:
+        notes.append(f"Telegram upload failed: {type(e).__name__}")
+    except Exception as e:
+        log.exception("Backup failed")
+        notes.append(f"{type(e).__name__}: {str(e)[:150]}")
+    await set_setting(session, "last_backup_at", now_utc().isoformat())
+    await set_setting(session, "last_backup_status", ("ok" if ok else "failed") + (" — " + "; ".join(notes) if notes else ""))
+    await audit(session, actor, "db.backup", label, ("ok" if ok else "failed") + (": " + "; ".join(notes) if notes else ""))
+    if notes:
+        await bot.send_message(chat_id, ("⚠️ " if not ok else "ℹ️ ") + "\n".join(esc(n) for n in notes))
+    return ok
+
+
+async def backup_screen(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
+    last_at = await get_setting(session, "last_backup_at", "")
+    last_status = await get_setting(session, "last_backup_status", "never")
+    last_restore = await get_setting(session, "last_restore_status", "never")
+    max_mb = await setting_int(session, "backup_max_mb", BACKUP_MAX_MB_DEFAULT)
+    text = ("🗄️ <b>Database Backup & Restore</b>\n\n"
+            f"Database: <b>{'SQLite' if IS_SQLITE else 'PostgreSQL'}</b>\n"
+            f"Last backup: {fmt_dt(datetime.fromisoformat(last_at)) if last_at else '—'} · {esc(last_status)}\n"
+            f"Last restore: {esc(last_restore)}\nMax upload size for restore: {max_mb} MB\n\n"
+            "Backup sends a portable <code>.json</code> (restorable here) plus a native SQL dump when available. "
+            "Files on the server are not kept — download them from Telegram and store them elsewhere.\n\n"
+            "⚠️ Restore <b>replaces every table</b> with the backup's contents. A safety backup of the current database is sent to you first.")
+    kb = inline([[("🗄️ Backup Database", "adm:backup"), ("♻️ Restore Database", "adm:restore")],
+                 [("📏 Max upload MB", "adm:set:backup_max_mb")], BACK_ADMIN])
+    return text, kb
+
+
+@router.message(AdminFlow.restore_upload, F.document)
+@admin_only
+async def admin_restore_upload(message: Message, session: AsyncSession, db_user: User, state: FSMContext, bot: Bot, **_):
+    doc = message.document
+    max_mb = min(20, max(1, await setting_int(session, "backup_max_mb", BACKUP_MAX_MB_DEFAULT)))
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer("❌ Please upload the portable <code>examyatra-backup-….json</code> file. Native .sql dumps are restored with sqlite3/psql (see README)."); return
+    if (doc.file_size or 0) > max_mb * 1024 * 1024:
+        await message.answer(f"❌ File is larger than the configured limit ({max_mb} MB)."); return
+    note = await message.answer("🔎 Downloading and validating the backup…")
+    try:
+        f = await bot.get_file(doc.file_id)
+        buf = io.BytesIO(); await bot.download_file(f.file_path, buf); raw = buf.getvalue()
+    except TelegramAPIError as e:
+        await safe_edit(note, f"❌ Could not download the file ({type(e).__name__})."); return
+    payload, err = validate_backup_payload(raw)
+    if err:
+        await audit(session, message.from_user.id, "db.restore.reject", doc.file_name, err)
+        await safe_edit(note, "❌ Backup rejected: " + esc(err)); return
+    tables = payload["tables"]
+    await state.update_data(restore_file_id=doc.file_id, restore_size=len(raw))
+    await safe_edit(note,
+        "⚠️ <b>CONFIRM DATABASE RESTORE</b>\n\n"
+        f"File: <code>{esc(doc.file_name)}</code> ({len(raw) / 1024:.0f} KB)\nCreated: {esc(payload.get('created_at', '?'))} · from {esc(payload.get('dialect', '?'))} · schema v{payload.get('schema_version')}\n"
+        f"Users {len(tables.get('users', []))} · Questions {len(tables.get('questions', []))} · Tests {len(tables.get('ai_tests', []))} · "
+        f"Payments {len(tables.get('payment_requests', []))} · Settings {len(tables.get('settings', []))}\n\n"
+        "Restoring will <b>delete all current rows</b> in every table and replace them with this backup. "
+        "A safety backup of the current database is created and sent to you first. If anything fails, the current data is kept unchanged.",
+        inline([[("✅ Yes, restore now", "adm:restore:go")], [("❌ Cancel", "adm:restore:cancel")]]))
+
+
+@router.message(AdminFlow.restore_upload)
+@admin_only
+async def admin_restore_other(message: Message, db_user: User, **_):
+    if _is_cmd(message): raise SkipHandler
+    await message.answer("Please upload the backup as a <b>file</b> (document), or /cancel.")
+
+
+async def perform_restore(cb: CallbackQuery, session: AsyncSession, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    file_id = data.get("restore_file_id")
+    if not file_id:
+        await cb.answer("No validated backup is waiting. Upload the file again.", show_alert=True); return
+    if BACKUP_LOCK.locked():
+        await cb.answer("Another backup/restore is running. Please wait.", show_alert=True); return
+    await cb.answer()
+    await state.clear()
+    actor, chat_id = cb.from_user.id, cb.message.chat.id
+    status = await safe_edit(cb.message, "♻️ Step 1/4 — re-downloading and validating the backup…")
+    async with BACKUP_LOCK:
+        try:
+            f = await bot.get_file(file_id)
+            buf = io.BytesIO(); await bot.download_file(f.file_path, buf); raw = buf.getvalue()
+        except TelegramAPIError as e:
+            await safe_edit(status, f"❌ Restore aborted: could not download the file ({type(e).__name__}). Nothing was changed."); return
+        payload, err = validate_backup_payload(raw)
+        if err:
+            await safe_edit(status, "❌ Restore aborted: " + esc(err) + "\nNothing was changed."); return
+        await safe_edit(status, "♻️ Step 2/4 — creating a safety backup of the current database…")
+        await session.commit()
+        if not await run_backup(bot, session, chat_id, actor, label="pre-restore safety"):
+            await session.commit()
+            await safe_edit(status, "❌ Restore aborted: the safety backup could not be created or delivered, so the current database was left untouched."); return
+        await session.commit()
+        await safe_edit(status, "♻️ Step 3/4 — restoring tables in one transaction…")
+        try:
+            counts = await restore_portable_backup(payload)
+        except Exception as e:
+            log.exception("Restore failed")
+            problems = await verify_database_access()
+            await set_setting(session, "last_restore_status", f"failed {fmt_dt(now_utc())}: {type(e).__name__}")
+            await audit(session, actor, "db.restore", "failed", f"{type(e).__name__}: {str(e)[:150]}"); await session.commit()
+            await safe_edit(status, f"❌ <b>Restore failed</b> — the transaction was rolled back.\n{esc(type(e).__name__)}: {esc(str(e)[:200])}\n\n" +
+                            ("✅ The original database is intact and accessible." if not problems else "⚠️ Post-check problems: " + esc("; ".join(problems)) +
+                             "\nRecovery: restore the pre-restore safety backup sent above, or load the native SQL dump with sqlite3/psql.")); return
+        await safe_edit(status, "♻️ Step 4/4 — verifying the restored database…")
+        problems = await verify_database_access()
+        async with Session() as s2:
+            users_n = int((await s2.execute(select(func.count()).select_from(User))).scalar_one())
+        if problems or users_n != counts.get("users", -1):
+            await set_setting(session, "last_restore_status", f"verification failed {fmt_dt(now_utc())}")
+            await audit(session, actor, "db.restore", "verification failed", "; ".join(problems)); await session.commit()
+            await safe_edit(status, "⚠️ Restore completed but verification found problems: " + esc("; ".join(problems) or "row count mismatch") +
+                            "\nRecovery: restore the pre-restore safety backup sent above."); return
+        await set_setting(session, "last_restore_status", f"ok {fmt_dt(now_utc())} ({counts.get('users', 0)} users)")
+        await audit(session, actor, "db.restore", "ok", json.dumps(counts)); await session.commit()
+        summary = " · ".join(f"{t} {n}" for t, n in counts.items() if n)
+        await safe_edit(status, f"✅ <b>Database restored and verified.</b>\n\n{esc(summary)}\n\nSettings cache was cleared; admins listed in ADMIN_IDS keep their rights.",
+                        inline([BACK_ADMIN]))
 
 
 
