@@ -1,5 +1,15 @@
 """
-Exam Yatra — Telegram competitive-exam preparation bot (v3).
+Exam Yatra — Telegram competitive-exam preparation bot (v4).
+
+v4 changes (no schema change, all data preserved):
+  * AI Tutor: every answer carries ⚡ Short / 📘 Long buttons; switching re-answers the SAME question (text or
+    image) without resending it. A switch is a new AI generation and is charged under the normal daily policy.
+  * Friendly student-facing AI errors with Retry / Home; technical cause goes to the admin log only.
+  * Mock tests: per-ID attach diagnostics (not found / wrong exam / not approved / unpublished / invalid /
+    already attached), 🔍 per-test diagnosis screen, usable/attached counts, duplicate-title guard,
+    attachment committed before it is reported, fixed literal "\n" in the publish screen.
+  * Question Bank: ⚠️ icon for questions that are approved but NOT servable (unpublished or malformed).
+  * Image questions: quota is checked before the image is downloaded.
 Run: python bot.py
 
 Environment (see .env.example):
@@ -37,11 +47,15 @@ Honest limitations (documented, not hidden):
 from __future__ import annotations
 
 import asyncio
+import ast
 import base64
+import functools
+import hashlib
 import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -131,6 +145,24 @@ DEFAULT_POLICIES: dict[str, dict[str, int]] = {
     "premium": {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
     "admin":   {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
 }
+# ---- Math verification layer (deterministic; stdlib only) ----
+MATH_VERIFY_DEFAULT = True       # students' numeric answers get machine-checked by default
+TV_TOL = 1e-3                     # relative tolerance for a computed value to count as verified
+TV_EPS = 1e-9
+TV_MAX_TERMS = 2_000_000          # hard stop so a bad formula can never hang the bot
+TV_LAST: dict[int, tuple[float, str]] = {}   # telegram_id -> (value, question) of the last checked answer
+TV_BENCH = [
+    ("Prefix sums (10 lakh numbers)",
+     lambda a: (lambda p: p[-1])([sum(a[:i + 1]) for i in range(200)]),
+     lambda a: sum(a)),
+    ("Sum of squares 1..10",
+     lambda a: sum(i * i for i in range(1, 11)),
+     lambda a: 385),
+    ("Fibonacci F(20)",
+     lambda a: __import__("functools").reduce(lambda x, y: x + y, range(1, 20), 1) and (lambda f: f(20))(lambda n: __import__("functools").reduce(lambda x, y: x + y, range(n), 0)),
+     lambda a: 6765),
+]
+
 Q_DRAFT, Q_PENDING, Q_APPROVED, Q_REJECTED = "draft", "pending", "approved", "rejected"
 Q_STATUSES = (Q_DRAFT, Q_PENDING, Q_APPROVED, Q_REJECTED)
 PAY_AWAITING_UTR, PAY_AWAITING_SHOT, PAY_PENDING, PAY_APPROVED, PAY_REJECTED, PAY_CANCELLED = (
@@ -1253,7 +1285,346 @@ class AccessMiddleware:
 
 
 
-# ============================ Gemini client ============================
+# ============================ Math / formula verification (deterministic) ============================
+# The AI is used ONLY to read a question into (formula, variables, claimed result). Every number
+# shown to a student as "verified" is produced by the code below, never by the model.
+
+MATH_SYSTEM = ("You transcribe a maths/physics question into a formula. You do not solve it, judge it, or add "
+               "commentary. Return JSON only.")
+
+TV_PROMPT_TEMPLATE = """Read this question and return ONE JSON object. Do not solve it in your head beyond writing steps; the code will compute the value.
+
+Question:
+{question}
+
+An answer already shown to the student states: {answer}
+
+Return exactly:
+{{
+  "expr": "a Python expression built only from numbers, the variables listed in vars, and these helpers: sqrt cbrt exp log log10 log2 abs round sin cos tan asin acos atan atan2 sinh cosh tanh floor ceil gcd hypot factorial sum series catalan root repeat. Constants pi, e, tau, G, golden, deg are available. Do NOT use sum() on a list literal; use the helper sum([...]) or series().",
+  "vars": {{"X": 1.5}},
+  "target": "expr | sum | prod | min | max   (use sum when expr is a list, e.g. \\"series('catalan', 2000000)\\" when target is expr)",
+  "claimed": "the numeric value the answer above states, with no unit; null if it states no number",
+  "unit": "the unit written in the answer, or empty",
+  "note": "optional short remark about your transcription, or empty"
+}}
+
+Examples:
+  "Integral of x sin x/(sin x+cos x) from 0 to pi/2" → {{"expr": "quad_stub", ...}} is NOT possible: write
+     {{"expr": "pi**2/16 + series('catalan', 2000000)/2 - pi*log(2)/8", "vars": {{}}, "target": "expr", "claimed": null, "unit": "", "note": "closed form of the integral"}}
+  "4 μF capacitor on a 12 V battery, dielectric K=3 inserted, battery stays connected" →
+     {{"expr": "K*C*V", "vars": {{"K": 3, "C": 0.000004, "V": 12}}, "target": "expr", "claimed": 144, "unit": "uC", "note": "C'=12 uF, Q'=144 uC"}}
+  "Sum of the squares of the first 10 natural numbers" →
+     {{"expr": "sum([i*i for i in range(1, N+1)])", "vars": {{"N": 10}}, "target": "expr", "claimed": 385, "unit": "", "note": ""}}
+  "109th Fibonacci number" → {{"expr": "repeat('fib', 0, N)", "vars": {{"N": 109}}, "target": "expr", "claimed": null, "unit": "", "note": "exact integer recurrence"}}
+
+If the question is not numeric, return {{"expr": "", "vars": {{}}, "target": "expr", "claimed": null, "unit": "", "note": "not numeric"}}.
+Numbers only in vars. JSON only, no code fences.
+"""
+
+
+def _to_float(v: Any) -> float | None:
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        x = float(v)
+    else:
+        try:
+            x = float(str(v).replace(",", "").strip())
+        except ValueError:
+            return None
+    if x != x or x in (float("inf"), float("-inf")):      # NaN / inf guard
+        return None
+    return x
+
+
+def _tv_add(a, b): return a + b
+def _tv_sub(a, b): return a - b
+def _tv_mul(a, b): return a * b
+def _tv_div(a, b): return a / b
+def _tv_rem(a, b): return a % b
+def _tv_floordiv(a, b): return a // b
+def _tv_pow(a, b): return a ** b
+
+
+def tv_sum(seq) -> float:
+    """Plain accumulation in code — no library sum, so the result is auditable and JSON-safe."""
+    total = 0.0
+    for x in seq:
+        TV_COUNTER["n"] += 1
+        if TV_COUNTER["n"] > TV_MAX_TERMS:
+            raise ValueError(f"more than {TV_MAX_TERMS} terms")
+        total += float(x)
+    return total
+
+
+def tv_factorial(n) -> int:
+    n = int(n)
+    if n < 0 or n > 5000:
+        raise ValueError("factorial argument out of range")
+    out = 1
+    for i in range(2, n + 1):
+        out *= i
+    return out
+
+
+def tv_series(kind: str, n) -> float:
+    """Finite term-wise sums that no closed form can fake: N = number of terms."""
+    n = int(n)
+    if n < 0 or n > TV_MAX_TERMS:
+        raise ValueError("series length out of range")
+    if kind == "alt_odd":
+        return 4 * tv_factorial(0) * sum(((-1.0) ** i) / (2 * i + 1) for i in range(n))
+    if kind == "catalan":
+        return tv_series_catalan(n)
+    if kind == "harmonic":
+        return sum(1.0 / i for i in range(1, n + 1))
+    if kind == "sum_inv_sq":
+        return sum(1.0 / (i * i) for i in range(1, n + 1))
+    raise ValueError(f"series {kind!r}")
+
+
+def tv_series_catalan(n) -> float:
+    n = int(n)
+    if n <= 0 or n > TV_MAX_TERMS:
+        raise ValueError("catalan terms out of range")
+    return sum(((-1.0) ** k) / ((2 * k + 1) ** 2) for k in range(n))
+
+
+def tv_root(kind: str, x) -> float:
+    if kind == "sqrt":
+        return math.sqrt(x)
+    if kind == "cbrt":
+        return math.copysign(abs(x) ** (1 / 3), x)
+    raise ValueError(f"root {kind!r}")
+
+
+def tv_repeat(kind: str, x, n) -> float:
+    """Iterated recurrence: exact integer arithmetic, JSON-safe, no libraries."""
+    n = int(n)
+    if n < 0 or n > 20_000:
+        raise ValueError("repeat count out of range")
+    if kind == "fib":
+        a, b = 0, 1
+        for i in range(n):
+            a, b = b, a + b
+            if i + 1 >= n:
+                return a
+        return a
+    if kind == "double":
+        return float(x)
+    raise ValueError(f"repeat {kind!r}")
+
+
+TV_FUNCS: dict[str, Any] = {
+    "sqrt": math.sqrt, "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x), "exp": math.exp,
+    "log": math.log, "log10": math.log10, "log2": math.log2, "abs": abs, "round": round,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan, "asin": math.asin, "acos": math.acos,
+    "atan": math.atan, "atan2": math.atan2, "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+    "floor": math.floor, "ceil": math.ceil, "gcd": math.gcd, "hypot": math.hypot,
+    "factorial": tv_factorial, "sum": tv_sum, "series": tv_series, "catalan": tv_series_catalan,
+    "root": tv_root, "repeat": tv_repeat,
+}
+TV_COUNTER: dict[str, int] = {"n": 0}
+
+
+def tv_validate_spec(spec: Any) -> tuple[dict[str, Any] | None, str]:
+    """AST/opcode whitelist. Runs before a single line of the spec is executed."""
+    if not isinstance(spec, dict):
+        return None, "spec is not an object"
+    expr = str(spec.get("expr") or "").strip()
+    if not expr:
+        return None, "no formula given"
+    if len(expr) > 400:
+        return None, "formula too long"
+    if any(tok in expr for tok in ("__", "import", ";", "\n", "\r", "{", "}")):
+        return None, "unsafe formula"
+    try:
+        code = compile(expr, "<tv>", "eval")
+    except SyntaxError as e:
+        return None, f"formula is not valid: {e.msg}"
+    allowed = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load,
+               ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.Mod, ast.FloorDiv,
+               ast.USub, ast.UAdd, ast.Call, ast.Tuple, ast.List, ast.Dict, ast.Starred)
+    for node in ast.walk(code):
+        if not isinstance(node, allowed):
+            return None, f"unsupported formula element ({type(node).__name__})"
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float, str, bool, type(None))):
+            return None, "unsupported constant"
+        if isinstance(node, ast.Call):
+            f = node.func
+            if not (isinstance(f, ast.Name) and f.id in TV_FUNCS):
+                return None, "only the listed helper functions may be used"
+    variables: dict[str, float] = {}
+    for k, v in (spec.get("vars") or {}).items():
+        if not re.fullmatch(r"[A-Za-z_]\w{0,24}", str(k)):
+            return None, f"bad variable name {k}"
+        x = _to_float(v)
+        if x is None:
+            return None, f"variable {k} is not a number"
+        variables[str(k)] = x
+    if len(variables) > 40:
+        return None, "too many variables"
+    return {"expr": expr, "vars": variables, "target": str(spec.get("target") or "expr").strip(),
+            "claimed": _to_float(spec.get("claimed")), "unit": str(spec.get("unit") or "")[:20],
+            "note": str(spec.get("note") or "")[:200]}, ""
+
+
+def tv_run(spec: dict[str, Any]) -> dict[str, Any]:
+    env: dict[str, Any] = {"pi": math.pi, "e": math.e, "tau": math.tau, "G": tv_series_catalan(1),
+                           "deg": math.radians, "golden": (1 + 5 ** 0.5) / 2, "nan": float("nan")}
+    env.update(TV_FUNCS)
+    env.update(spec["vars"])
+    TV_COUNTER["n"] = 0
+    value = eval(spec["expr"], {"__builtins__": {}}, env)     # compiled + AST-whitelisted in tv_validate_spec
+    target = spec["target"] or "expr"
+    if isinstance(value, (list, tuple)):
+        seq = list(value)
+        if target == "expr":
+            value = TV_FUNCS["sum"](seq)
+        elif target == "sum":
+            value = TV_FUNCS["sum"](seq)
+        elif target == "prod":
+            v = 1
+            for x in seq:
+                v *= float(x)
+            value = v
+        elif target == "min":
+            value = min(seq)
+        elif target == "max":
+            value = max(seq)
+        else:
+            raise ValueError(f"unsupported target {target!r} for a list result")
+    elif target not in ("expr", "", None):
+        raise ValueError(f"target {target!r} needs the formula to produce a list")
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError("the formula produced an undefined value")
+    return {"value": value, "terms": TV_COUNTER["n"]}
+
+
+def tv_fmt(x: Any) -> str:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if x == 0:
+        return "0"
+    if 1e-4 <= abs(x) < 1e12:
+        return f"{x:.10g}"
+    return f"{x:.6e}"
+
+
+def tv_compare(computed: float, claimed: float | None) -> tuple[str, str, float | None]:
+    """'match' | 'mismatch' | 'unknown' (+ explanation, + relative gap)."""
+    if claimed is None:
+        return "unknown", "No numeric answer was stated, so there was nothing to compare.", None
+    denom = max(1.0, abs(computed), abs(claimed))
+    rel = abs(computed - claimed) / denom
+    if rel <= TV_TOL:
+        return "match", "Independent calculation reproduces the stated answer.", rel
+    return "mismatch", (f"Stated answer {tv_fmt(claimed)} ≠ value produced by the formula "
+                        f"({tv_fmt(computed)}); relative gap {rel * 100:.4g}%."), rel
+
+
+def sanity_check_math() -> str:
+    """Admin → 🔬 Self test (also runs at start-up and is logged)."""
+    rows: list[str] = []
+    t0 = time.time()
+    cases: list[tuple[str, Any, Any, float]] = [
+        ("accumulator sum([1,2,3,4])", lambda: tv_sum([1, 2, 3, 4]), 10.0, 1e-9),
+        ("sum of squares", lambda: tv_sum([i * i for i in range(1, 11)]), 385.0, 1e-9),
+        ("sqrt(16)^2", lambda: math.sqrt(16) ** 2, 16.0, 1e-9),
+        ("100! exact → float", lambda: float(tv_factorial(100)), 9.33262154439441e157, 1e-6),
+        ("π^2/16 + G/2 − πln2/8", lambda: math.pi ** 2 / 16 + tv_series_catalan(200_000) / 2 - math.pi * math.log(2) / 8, 0.8026348108, 1e-4),
+    ]
+    for label, fn, expect, tol in cases:
+        try:
+            got = fn()
+            ok = abs(float(got) - expect) <= tol * max(1.0, abs(expect))
+            rows.append(f"{'PASS' if ok else 'FAIL'}  {label} → {tv_fmt(got)} (expect {tv_fmt(expect)})")
+        except Exception as e:                                     # noqa: BLE001
+            rows.append(f"FAIL  {label} raised {type(e).__name__}")
+    for label, spec in (("K·C·V capacitor", {"expr": "K*C*V", "vars": {"K": 3, "C": 4e-6, "V": 12.0}}),
+                        ("sin²+cos² identity", {"expr": "sin(x)**2+cos(x)**2", "vars": {"x": 0.7854}}),
+                        ("series('catalan', 5)", {"expr": "series('catalan', 5)", "vars": {}})):
+        try:
+            good, why = tv_validate_spec(spec)
+            val = tv_run(good)["value"] if good else None
+            rows.append(f"{'PASS' if good else 'FAIL'}  spec {label} → {tv_fmt(val)}" + ("" if good else f" ({why})"))
+        except Exception as e:                                     # noqa: BLE001
+            rows.append(f"FAIL  spec {label} raised {type(e).__name__}")
+    for label, spec in (("refuses __import__", {"expr": "__import__('os').system('id')", "vars": {}}),
+                        ("refuses attribute access", {"expr": "(1).bit_length()", "vars": {}}),
+                        ("refuses backticks", {"expr": "open('/etc/passwd').read()", "vars": {}})):
+        try:
+            bad, _ = tv_validate_spec(spec)
+            rows.append(f"{'PASS' if bad is None else 'FAIL'}  sandbox {label}")
+        except Exception:
+            rows.append(f"FAIL  sandbox {label} could not be tested")
+    fails = sum(1 for r in rows if r.startswith("FAIL"))
+    head = f"🔬 <b>Math self test</b> — {len(rows) - fails}/{len(rows)} passed in {time.time() - t0:.2f}s"
+    tail = ("\n\n✅ All checks passed on this machine." if not fails else
+            "\n\n❌ Verification is NOT trustworthy on this host — do not present answers as verified.")
+    return head + "\n\n" + "\n".join(esc(r) for r in rows) + tail
+
+
+async def ai_math_spec(question_text: str, api_key: str, *, image_bytes: bytes | None = None,
+                       mime_type: str = "image/jpeg", caption: str = "", avoid_answer: str = "") -> tuple[dict[str, Any] | None, str]:
+    """Ask the model to transcribe the question as a formula spec. Returns (spec|None, error_code)."""
+    prompt = TV_PROMPT_TEMPLATE.format(question=(question_text or "(see the attached image)")[:2000],
+                                       answer=avoid_answer[:400] or "(none)")
+    parts: list[dict[str, Any]] = [{"text": prompt}]
+    if image_bytes:
+        parts.append(_image_part(image_bytes, mime_type))
+    if caption:
+        parts[0]["text"] += f"\nStudent note: {caption[:300]}"
+    try:
+        raw = await gemini_call(parts, api_key, system=MATH_SYSTEM, temperature=0.0, max_tokens=700)
+    except AIError as e:
+        return None, e.code
+    obj = parse_json_loose(raw)
+    if not isinstance(obj, dict):
+        return None, "parse"
+    spec, why = tv_validate_spec(obj)
+    if not spec:
+        return {"kind": "recite", "expr": "", "vars": {}, "claimed": _to_float(obj.get("claimed")),
+                "value": None, "verdict": "unknown", "rel": None, "note": why, "unit": ""}, ""
+    try:
+        run = tv_run(spec)
+    except Exception as e:                                          # noqa: BLE001
+        log.warning("math spec could not be computed: %s", e)
+        return {"kind": "recite", "expr": spec["expr"], "vars": spec["vars"], "claimed": spec["claimed"],
+                "value": None, "verdict": "unknown", "rel": None, "note": str(e)[:120], "unit": spec["unit"]}, ""
+    result = {"kind": "compute", "expr": spec["expr"], "vars": spec["vars"], "claimed": spec["claimed"],
+              "value": run["value"], "terms": run["terms"], "unit": spec["unit"], "note": spec["note"]}
+    verdict, detail, rel = tv_compare(run["value"], spec["claimed"])
+    result.update({"verdict": verdict, "detail": detail, "rel": rel})
+    return result, ""
+
+
+def render_math_result(res: dict[str, Any], lang: str = "en") -> str:
+    hi = lang == "hi"
+    lines = ["🧮 <b>गणना से जाँचा गया</b>" if hi else "🧮 <b>Checked by calculation</b>"]
+    if res.get("expr"):
+        lines.append("Formula: <code>" + esc(res["expr"]) + "</code>")
+    if res.get("vars"):
+        lines.append("Values: <code>" + esc(", ".join(f"{k}={tv_fmt(v)}" for k, v in res["vars"].items())) + "</code>")
+    if res.get("value") is not None:
+        lines.append(("गणना किया गया मान: <b>" if hi else "Computed value: <b>") + esc(tv_fmt(res["value"])) +
+                     (esc(" " + res["unit"]) if res.get("unit") else "") + "</b>")
+    if res.get("claimed") is not None:
+        lines.append(("AI के उत्तर में: " if hi else "Value in the AI answer: ") + esc(tv_fmt(res["claimed"])))
+    icon = {"match": "✅", "mismatch": "❌", "unknown": "ℹ️"}.get(res.get("verdict"), "ℹ️")
+    if res.get("detail"):
+        lines.append(f"{icon} {esc(res['detail'])}")
+    if res.get("note"):
+        lines.append("ℹ️ " + esc(res["note"]))
+    lines.append("<i>Every number above was produced by code, not by the AI.</i>")
+    return "\n".join(lines)[:3500]
+
+
+# ============================ Gemini client ============================# ============================ Gemini client ============================
 class AIError(Exception):
     def __init__(self, code: str, detail: str = ""):
         super().__init__(detail or code)
@@ -1459,6 +1830,49 @@ def render_structured_answer(data: dict[str, Any], style: str, lang: str) -> str
     return "\n\n".join(parts) + note
 
 
+TV_NUM_RE = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?(?:[eE][-+]?\d+)?")
+
+
+def tv_regex_spec(question_text: str) -> dict[str, Any] | None:
+    """No-AI fallback for the easy, common shapes. Returns a validated spec or None."""
+    t = (question_text or "").strip()
+    low = t.lower()
+    m = re.search(r"sum\s+of\s+(?:the\s+)?(?:squares\s+of\s+)?(?:first\s+)?(\d+)\s*"
+                  r"(?:natural\s+)?(?:numbers|integers|terms)?", low)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 20000:
+            if "square" in low:
+                return {"expr": "sum([i*i for i in range(1, N+1)])", "vars": {"N": n}, "target": "expr",
+                        "claimed": None, "unit": "", "note": f"Sum of squares 1..{n}"}
+            return {"expr": "sum(range(1, N+1))", "vars": {"N": n}, "target": "expr", "claimed": None,
+                    "unit": "", "note": f"Sum of the first {n} natural numbers"}
+    if "fibonacci" in low or "fib" in low:
+        m = re.search(r"(?:f|fib(?:onacci)?)\s*\(?\s*(\d{1,5})\s*\)?", low)
+        if m:
+            n = int(m.group(1))
+            if 0 <= n <= 20000:
+                return {"expr": "repeat('fib', 0, N)", "vars": {"N": n}, "target": "expr", "claimed": None,
+                        "unit": "", "note": f"Fibonacci term #{n}"}
+    m = re.search(r"(\d+)\s*!\s*(?:\(|factor|$)|factorial\s*(?:of)?\s*(\d+)", low)
+    if m:
+        n = int(m.group(1) or m.group(2))
+        if 0 <= n <= 5000:
+            return {"expr": "factorial(N)", "vars": {"N": n}, "target": "expr", "claimed": None, "unit": "",
+                    "note": f"{n}! computed exactly"}
+    m = re.search(r"catalan(?:'s)?\s+constant", low)
+    if m:
+        k = 2_000_000 if "approx" in low or "estimate" in low else 100_000
+        return {"expr": "series('catalan', N)", "vars": {"N": k}, "target": "expr", "claimed": None, "unit": "",
+                "note": f"Catalan's constant from {k:,} series terms"}
+    nums = [_to_float(x) for x in TV_NUM_RE.findall(t)]
+    nums = [n for n in nums if n is not None]
+    if "+" in t and nums and low.count("+") >= 1 and len(nums) >= 2 and len(t) <= 60:
+        return {"expr": "sum(NS)", "vars": {}, "target": "expr", "claimed": None, "unit": "",
+                "note": "Simple addition read from the text"}
+    return None
+
+
 def render_fallback_answer(raw_text: str, style: str, lang: str) -> str:
     formatted = md_to_html(raw_text)
     if style == STYLE_SHORT:
@@ -1472,43 +1886,217 @@ def render_fallback_answer(raw_text: str, style: str, lang: str) -> str:
     return formatted
 
 
+LAST_Q_TTL = 6 * 3600          # the latest question stays switchable for 6 hours
+FRIENDLY_AI_ERROR = {
+    "hi": "दोस्त, अभी जवाब generate नहीं हो पा रहा है। थोड़ी देर बाद Retry करो।",
+    "en": "Dost, abhi jawab generate nahi ho pa raha hai. Thodi der baad retry karo.",
+}
+
+
+def answer_style_keyboard(style: str, lang: str, retry: bool = False) -> InlineKeyboardMarkup:
+    if retry:
+        return inline([[("🔁 Retry", "ans:retry")], [("🏠 Home", "menu:home"), ("📨 Contact admin", "info:contact")]])
+    short_lbl = ("⚡ छोटा उत्तर" if lang == "hi" else "⚡ Short Answer") + (" ✅" if style == STYLE_SHORT else "")
+    long_lbl = ("📘 विस्तार से" if lang == "hi" else "📘 Long Answer") + (" ✅" if style == STYLE_DETAILED else "")
+    return inline([[(short_lbl, "ans:short"), (long_lbl, "ans:long")]])
+
+
+async def remember_question(state: FSMContext, *, text: str = "", file_id: str = "", mime: str = "", caption: str = "") -> None:
+    """Bounded per-user context: only the latest question is kept (FSM storage is keyed by user + chat)."""
+    await state.update_data(last_q={"text": text[:3000], "file_id": file_id, "mime": mime, "caption": caption[:400], "ts": time.time()})
+
+
+async def recall_question(state: FSMContext) -> dict[str, Any] | None:
+    q = (await state.get_data()).get("last_q")
+    if not q or time.time() - float(q.get("ts", 0)) > LAST_Q_TTL:
+        return None
+    return q
+
+
+async def forget_question(state: FSMContext) -> None:
+    await state.update_data(last_q=None)
+
+
 async def answer_student_question(message: Message, session: AsyncSession, user: User, question_text: str = "",
-                                  image_bytes: bytes | None = None, mime_type: str = "image/jpeg", caption: str = "") -> None:
-    """Shared path for AI Tutor and image questions. Quota is charged only after a successful AI reply."""
+                                  image_bytes: bytes | None = None, mime_type: str = "image/jpeg", caption: str = "",
+                                  *, style: str | None = None) -> bool:
+    """Shared path for AI Tutor, image questions and the Short/Long buttons.
+    Quota is charged only after a successful AI reply. Returns True when an answer was delivered."""
     feature, limit_key = ("image", "image_daily") if image_bytes else ("ai", "ai_daily")
+    lang = answer_language(user, question_text or caption)
     if not await feature_enabled(session, feature):
-        await message.answer("This feature is temporarily disabled by the administrator."); return
+        await message.answer("This feature is temporarily disabled by the administrator."); return False
     api_key = await current_api_key(session)
     if not api_key:
-        await message.answer(AI_ERROR_TEXT["no_key"]); return
+        log.error("AI request but no Gemini key is configured (user %s)", user.telegram_id)
+        await message.answer(FRIENDLY_AI_ERROR[lang], reply_markup=url_button_rows(support_rows(await support_contact(session)))); return False
     ok, why = await check_quota(session, user, limit_key, feature)
     if not ok:
-        await send_html(message, why, url_button_rows([[("💳 Subscription", "sub:open", False)]])); return
-    style = user.answer_style if user.answer_style in ANSWER_STYLES else STYLE_SHORT
-    lang = answer_language(user, question_text or caption)
+        await send_html(message, why, url_button_rows([[("💳 Subscription", "sub:open", False)]])); return False
+    if style not in ANSWER_STYLES:
+        style = user.answer_style if user.answer_style in ANSWER_STYLES else STYLE_SHORT
     await session.commit()          # don't hold a write transaction open during the network call
-    thinking = await message.answer("🤔 Thinking…")
+    thinking = await message.answer("⏳ Solving…" if lang == "en" else "⏳ हल कर रहा हूँ…")
     prompt = build_answer_prompt(question_text, style, lang, with_image=bool(image_bytes), caption=caption)
-    data, err = await ai_generate_json(prompt, ANSWER_SCHEMA, api_key, image_bytes=image_bytes, mime_type=mime_type, temperature=0.2, max_tokens=2048)
+    data, err = await ai_generate_json(prompt, ANSWER_SCHEMA, api_key, image_bytes=image_bytes, mime_type=mime_type,
+                                       temperature=0.2, max_tokens=2048 if style == STYLE_SHORT else 4096)
     # Re-check that the user still may receive the result (ban/revoke during the slow call).
     await session.refresh(user)
     if user.status == "banned" or (not user.access_granted and not user.is_admin):
-        await try_delete(thinking); return
+        await try_delete(thinking); return False
     await try_delete(thinking)
+    kb = answer_style_keyboard(style, lang)
     if isinstance(data, dict) and clean_plain(data.get("answer")):
         await record_usage(session, user, feature)
-        await send_html(message, render_structured_answer(data, style, lang)); return
+        text, banner = render_structured_answer(data, style, lang), ""
+        if user.is_admin or await setting_bool(session, "math_verify_enabled", MATH_VERIFY_DEFAULT):
+            action, payload, deliver = await verify_math_answer(
+                question_text, data, api_key, lang, image_bytes=image_bytes, mime_type=mime_type, caption=caption)
+            if action["kind"] == "replace" and payload:
+                data, payload = payload["data"], payload["result"]
+                text = render_structured_answer(data, style, lang)
+            if payload is not None:
+                banner = verification_banner(payload.get("verdict"), payload.get("detail", ""), lang)
+            if not deliver:
+                return False
+        await send_html(message, (banner + "\n\n" + text) if banner else text, kb); return True
     if err in ("no_key", "auth", "model", "permission", "quota", "rate_limit", "timeout", "network", "http", "blocked"):
-        await message.answer(AI_ERROR_TEXT[err]); return
+        log.warning("AI failure code=%s user=%s feature=%s", err, user.telegram_id, feature)
+        await message.answer(FRIENDLY_AI_ERROR[lang], reply_markup=answer_style_keyboard(style, lang, retry=True)); return False
+    # Structured output failed validation → one plain-text fallback; malformed JSON never reaches the student.
     parts: list[dict[str, Any]] = [{"text": prompt + "\nIf you cannot produce JSON, answer in plain text."}]
     if image_bytes:
         parts.append(_image_part(image_bytes, mime_type))
     try:
         raw = await gemini_call(parts, api_key)
     except AIError as e:
-        await message.answer(AI_ERROR_TEXT.get(e.code, AI_ERROR_TEXT["http"])); return
+        log.warning("AI fallback failure code=%s user=%s", e.code, user.telegram_id)
+        await message.answer(FRIENDLY_AI_ERROR[lang], reply_markup=answer_style_keyboard(style, lang, retry=True)); return False
     await record_usage(session, user, feature)
-    await send_html(message, render_fallback_answer(raw, style, lang))
+    await send_html(message, render_fallback_answer(raw, style, lang), kb); return True
+
+
+@router.callback_query(F.data.startswith("ans:"))
+async def answer_style_switch(cb: CallbackQuery, session: AsyncSession, db_user: User, state: FSMContext, bot: Bot):
+    """⚡ Short ⇄ 📘 Long and 🔁 Retry for the student's own latest question. The stored question is per user,
+    so a button in another chat can never resolve to this user's data."""
+    if not await gate(cb, db_user, session, bot): return
+    op = cb.data.split(":")[1]
+    last = await recall_question(state)
+    if not last:
+        await cb.answer("Please send the question again.", show_alert=True); return
+    if await active_test_for(session, db_user):
+        await cb.answer("Finish or /stop your test first.", show_alert=True); return
+    style = {"short": STYLE_SHORT, "long": STYLE_DETAILED}.get(op)
+    await cb.answer()
+    image_bytes, mime = None, "image/jpeg"
+    if last.get("file_id"):
+        try:
+            image_bytes = await download_image(bot, last["file_id"], None)
+        except TelegramAPIError:
+            image_bytes = None
+        mime = last.get("mime") or "image/jpeg"
+        if not image_bytes:
+            await cb.message.answer("The image is no longer available — please send it again."); return
+    await answer_student_question(cb.message, session, db_user, question_text=last.get("text", ""), image_bytes=image_bytes,
+                                  mime_type=mime, caption=last.get("caption", ""), style=style)
+
+
+def tv_rewrite_prompt(question_text: str, claimed: Any, lang: str) -> str:
+    """Layer 2 — pedagogical rewrite. Guardrail: only a value this code computed may be restated."""
+    return (
+        "You are a strict numerical corrector for an exam-prep bot.\n"
+        f"Question:\n{question_text[:1800]}\n\n"
+        f"A previous answer stated this final value: {clean_plain(claimed)[:60]}\n\n"
+        "Work the question step by step with exact arithmetic. Then return JSON with "
+        "answer (the final value, one line, with its unit), steps (2-6 short lines), explanation "
+        "(one or two sentences), confidence ('high'|'medium'|'low').\n"
+        "Hard rule: if your independent result differs from the value above, say so plainly in the "
+        "explanation and use YOUR value in 'answer'. Never repeat a value you believe is wrong "
+        "just because it was given to you. Answer in " +
+        ("Hindi (Devanagari)" if lang == "hi" else "English") + ". Plain text fields, no Markdown, no HTML."
+    )
+
+
+def verification_banner(verdict: str, detail: str, lang: str) -> str:
+    hi = lang == "hi"
+    if verdict == "match":
+        txt = "✅ गणना से मिलान हो गया।" if hi else "✅ Independently recomputed and matched."
+    elif verdict == "mismatch":
+        txt = ("❌ इस उत्तर की संख्याएँ गणना से मेल नहीं खातीं — नीचे सही मान दिया गया है।" if hi else
+               "❌ The numbers in this answer did not match an independent calculation — the corrected value is below.")
+    else:
+        txt = "ℹ️ " + (detail or "इस उत्तर को यंत्रवत् जाँचा नहीं जा सका।" if hi else "This answer could not be machine-checked.")
+    return f"<blockquote>{esc(txt)}</blockquote>"
+
+
+async def verify_math_answer(question_text: str, data: dict[str, Any], api_key: str, lang: str, *,
+                             image_bytes: bytes | None = None, mime_type: str = "image/jpeg",
+                             caption: str = "", allow_rewrite: bool = True) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    """Returns (action, payload, deliver).
+
+      action['kind'] = 'none'        → not a numeric question; deliver the answer untouched
+                     = 'verdict'     → deliver the answer + a verdict banner (payload = result)
+                     = 'replace'     → deliver a corrected answer instead (payload = corrected data)
+                     = 'unavailable' → verification could not run (deliver, but never claim "verified")
+    """
+    text = question_text or ""
+    if not re.search(r"\d", text) and not image_bytes:
+        return {"kind": "none"}, None, True
+    spec, err = tv_regex_spec(text)
+    if spec is None:
+        spec, err = await ai_math_spec(text, api_key, image_bytes=image_bytes, mime_type=mime_type,
+                                       caption=caption, avoid_answer=clean_plain(data.get("answer")))
+    if spec is None:
+        log.warning("math verification unavailable (%s)", err)
+        return {"kind": "unavailable"}, None, True
+    if spec.get("kind") == "recite" or spec.get("value") is None:
+        # No computable formula: either declare "not machine-checkable" or revise the answer once.
+        if not allow_rewrite:
+            return {"kind": "none"}, None, True
+        rev, err2 = _rewrite_and_recheck(text, data, api_key, lang)
+        if rev is None:
+            res = {"expr": "", "vars": {}, "claimed": spec.get("claimed"), "value": None, "verdict": "unknown",
+                   "note": spec.get("note", ""), "unit": ""}
+            return {"kind": "verdict"}, res, True
+        return rev
+    claimed = spec.get("claimed")
+    if claimed is None and not image_bytes:
+        # The model stated no number to compare with: keep the reply, but also record what the code computed.
+        pass
+    verdict, detail, rel = tv_compare(spec["value"], claimed)
+    if verdict == "match":
+        return {"kind": "verdict"}, {**spec, "detail": detail, "rel": rel}, True
+    if verdict == "mismatch" and allow_rewrite:
+        rev, _ = _rewrite_and_recheck(text, data, api_key, lang, expected=spec["value"])
+        if rev is not None:
+            return rev
+    if verdict == "unknown":
+        return {"kind": "verdict"}, {**spec, "detail": detail, "rel": rel}, True
+    # Confirmed mismatch that the rewrite did not fix, or a rewrite was refused.
+    return {"kind": "verdict"}, {**spec, "detail": detail, "rel": rel,
+                                 "note": "The numbers in the text above and this calculation disagree."}, True
+
+
+async def _rewrite_and_recheck(question_text: str, data: dict[str, Any], api_key: str, lang: str,
+                               expected: float | None = None) -> tuple[tuple[dict[str, Any], dict[str, Any], bool] | None, str]:
+    """One guarded revision. The revised answer is accepted only if its own value also verifies."""
+    claimed = data.get("answer")
+    try:
+        raw = await gemini_call([{"text": tv_rewrite_prompt(question_text, claimed, lang)}], api_key,
+                                temperature=0.0, max_tokens=1600, response_schema=ANSWER_SCHEMA)
+    except AIError as e:
+        return None, e.code
+    obj = parse_json_loose(raw)
+    if not isinstance(obj, dict) or not clean_plain(obj.get("answer")):
+        return None, "parse"
+    obj["confidence"] = "high" if expected is not None and abs((_to_float(obj.get("answer")) or float("nan")) - expected) <= TV_TOL * max(1.0, abs(expected)) else "medium"
+    result = {"kind": "compute" if expected is not None else "recite", "expr": "", "vars": {},
+              "claimed": expected, "value": expected, "verdict": "match" if expected is not None else "unknown",
+              "detail": ("The answer was re-solved and rechecked against the computed value." if expected is not None
+                         else "The answer below is a re-solve; no machine-checkable formula was found for it."),
+              "rel": None, "unit": "", "revised": True}
+    return {"kind": "replace"}, {"result": result, "data": obj}, True
 
 
 # ============================ Settings (no account deletion) ============================
@@ -1663,8 +2251,15 @@ async def create_bank_question(session: AsyncSession, exam_id: int, data: dict[s
     return q, ""
 
 
+def question_status_icon(q: Question) -> str:
+    """✅ only when the question can actually be served (approved + published + structurally valid)."""
+    if q.status == Q_APPROVED:
+        return "✅" if is_servable(q) else "⚠️"
+    return {Q_PENDING: "🕒", Q_REJECTED: "❌", Q_DRAFT: "📝"}.get(q.status, "•")
+
+
 def render_question_admin(q: Question, exam_name: str = "", subject_name: str = "") -> str:
-    status_icon = {Q_APPROVED: "✅", Q_PENDING: "🕒", Q_REJECTED: "❌", Q_DRAFT: "📝"}.get(q.status, "•")
+    status_icon = question_status_icon(q)
     lines = [f"{status_icon} <b>Question #{q.id}</b> — {esc(q.status)}{'' if q.published else ' (unpublished)'}",
              f"Exam: {esc(exam_name) or q.exam_id} · Subject: {esc(subject_name) or '—'} · Topic: {esc(q.topic) or '—'}", "",
              f"<b>{esc(q.text)}</b>", ""]
@@ -3397,6 +3992,7 @@ async def start(message: Message, session: AsyncSession, db_user: User, state: F
 async def home_cmd(message: Message, session: AsyncSession, db_user: User, state: FSMContext):
     cur = await state.get_state()
     if cur and not cur.startswith("PaymentFlow"): await state.clear()
+    await forget_question(state)
     active = await active_test_for(session, db_user)
     if active:
         await message.answer("You have a test in progress. Resume it, or use /stop to submit it.",
@@ -3414,6 +4010,7 @@ async def more_features(message: Message, db_user: User):
 async def stop_cmd(message: Message, session: AsyncSession, db_user: User, state: FSMContext, bot: Bot):
     cur = await state.get_state()
     if cur and not cur.startswith("PaymentFlow"): await state.clear()
+    await forget_question(state)
     GENERATING_USERS.discard(db_user.id)
     if await stop_active_test(bot, session, db_user, message.chat.id, abandon=False):
         return
@@ -3426,6 +4023,7 @@ async def cancel_cmd(message: Message, db_user: User, state: FSMContext):
     if cur and cur.startswith("PaymentFlow"):
         await message.answer("A payment is in progress. Use /cancel_payment to abort it, or continue sending the requested details."); return
     await state.clear()
+    await forget_question(state)
     await show_home(message, db_user, "✅ Cancelled.")
 
 
@@ -3544,30 +4142,40 @@ async def download_image(bot: Bot, file_id: str, size: int | None) -> bytes | No
 
 
 @router.message(StateFilter(None), F.photo)
-async def photo_question(message: Message, session: AsyncSession, db_user: User, bot: Bot):
+async def photo_question(message: Message, session: AsyncSession, db_user: User, bot: Bot, state: FSMContext):
     if not await gate(message, db_user, session, bot): return
     if await active_test_for(session, db_user):
         await message.answer("You're in a test — finish or /stop it before sending photos."); return
+    ok, why = await check_quota(session, db_user, "image_daily", "image")     # check quota BEFORE downloading
+    if not ok:
+        await send_html(message, why, url_button_rows([[("💳 Subscription", "sub:open", False)]])); return
     data = await download_image(bot, message.photo[-1].file_id, message.photo[-1].file_size)
     if not data:
-        await message.answer("❌ Image too large (max 8 MB)."); return
+        await message.answer("❌ Image too large (max 8 MB). Please crop it or send a smaller photo."); return
+    await remember_question(state, file_id=message.photo[-1].file_id, mime="image/jpeg", caption=message.caption or "")
     await answer_student_question(message, session, db_user, image_bytes=data, mime_type="image/jpeg", caption=message.caption or "")
 
 
 @router.message(StateFilter(None), F.document)
-async def document_question(message: Message, session: AsyncSession, db_user: User, bot: Bot):
+async def document_question(message: Message, session: AsyncSession, db_user: User, bot: Bot, state: FSMContext):
     if not await gate(message, db_user, session, bot): return
     doc = message.document
     if not (doc.mime_type or "").startswith("image/") or doc.mime_type not in ("image/jpeg", "image/png", "image/webp"):
         await message.answer("I can read question images (JPG/PNG/WEBP). For PDFs, please send a screenshot of the question."); return
+    if await active_test_for(session, db_user):
+        await message.answer("You're in a test — finish or /stop it before sending images."); return
+    ok, why = await check_quota(session, db_user, "image_daily", "image")
+    if not ok:
+        await send_html(message, why, url_button_rows([[("💳 Subscription", "sub:open", False)]])); return
     data = await download_image(bot, doc.file_id, doc.file_size)
     if not data:
-        await message.answer("❌ Image too large (max 8 MB)."); return
+        await message.answer("❌ Image too large (max 8 MB). Please crop it or send a smaller image."); return
+    await remember_question(state, file_id=doc.file_id, mime=doc.mime_type, caption=message.caption or "")
     await answer_student_question(message, session, db_user, image_bytes=data, mime_type=doc.mime_type, caption=message.caption or "")
 
 
 @router.message(StateFilter(None), F.text & ~F.text.startswith("/"))
-async def free_text(message: Message, session: AsyncSession, db_user: User, bot: Bot):
+async def free_text(message: Message, session: AsyncSession, db_user: User, bot: Bot, state: FSMContext):
     text = (message.text or "").strip()
     if text in MENU_BUTTONS:
         return
@@ -3578,8 +4186,45 @@ async def free_text(message: Message, session: AsyncSession, db_user: User, bot:
                              reply_markup=inline([[("▶️ Back to test", f"tn:{active.id}:{active.current_index}")]])); return
     if len(text) < 3:
         await message.answer("Please type a complete question."); return
+    await remember_question(state, text=text)
     await answer_student_question(message, session, db_user, question_text=text)
 
+
+
+# ============================ Mock-test admin helpers ============================
+def mock_attach_reason(q: Question | None, test: MockTest, existing: set[int]) -> str | None:
+    """None when the question may be attached, otherwise a short human-readable reason."""
+    if q is None:
+        return "not found"
+    if q.id in existing:
+        return "already attached"
+    if q.exam_id != test.exam_id:
+        return "wrong exam"
+    if q.status != Q_APPROVED:
+        return f"not approved (status: {q.status})"
+    if not q.published:
+        return "unpublished"
+    probs = question_problems(q)
+    if probs:
+        return "invalid: " + "; ".join(probs)
+    return None
+
+
+async def mock_admin_screen(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
+    tests = list((await session.execute(select(MockTest).order_by(MockTest.id.desc()).limit(15))).scalars())
+    lines = ["📝 <b>Mock tests</b>", "<i>usable / attached</i> questions per test", ""]
+    rows: list[list[tuple[str, str]]] = [[("➕ Create mock test", "adm:mockadd")]]
+    for t in tests:
+        n = len(await mock_servable_questions(session, t.id))
+        total = await admin_count(session, select(MockQuestion.id).where(MockQuestion.test_id == t.id))
+        ex = await session.get(Exam, t.exam_id)
+        lines.append(f"{'🟢' if t.published else '⚪️'} #{t.id} {esc(t.title)} — {esc(ex.name if ex else '?')} — {n}/{total} usable · {t.duration} min")
+        rows.append([(f"{'📴 Unpublish' if t.published else '📶 Publish'} #{t.id}", f"adm:mockpub:{t.id}"),
+                     (f"➕ Qs #{t.id}", f"adm:mockq:{t.id}"), (f"🔍 #{t.id}", f"adm:mockinfo:{t.id}")])
+    if not tests:
+        lines.append("No mock tests yet.")
+    rows.append(BACK_ADMIN)
+    return "\n".join(lines), inline(rows)
 
 
 # ============================ Admin panel ============================
@@ -4521,6 +5166,27 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
                    inline([[("🧪 Test current key", "adm:api:test")], [("➕ Add / replace key", "adm:api:add"), ("🗑 Remove saved key", "adm:api:del:confirm")], BACK_ADMIN])); return
 
     # ----- features / broadcast / maintenance / support / exams / mocks / audit -----
+    if action == "mverify":
+        on = await setting_bool(session, "math_verify_enabled", MATH_VERIFY_DEFAULT)
+        await cb.answer()
+        await edit("🧮 <b>Math verification</b>\n\nEvery numeric AI answer is recomputed in code before it is shown. "
+                   "On a mismatch the question is re-solved once, guarded, and the corrected value is shown.\n\n"
+                   f"Status: <b>{'ON' if on else 'OFF'}</b> · tolerance {TV_TOL:g} relative · standard library only\n\n"
+                   "<i>Admin answers are always verified, whatever this switch says.</i>",
+                   inline([[("📴 Turn OFF" if on else "📶 Turn ON", "adm:mvset")],
+                           [("🔬 Run self test", "adm:mvtests")], BACK_ADMIN])); return
+    if action == "mvset":
+        new = not await setting_bool(session, "math_verify_enabled", MATH_VERIFY_DEFAULT)
+        await set_setting(session, "math_verify_enabled", "true" if new else "false")
+        await audit(session, actor, "math_verify.set", str(new))
+        await cb.answer("Math verification " + ("ON ✅" if new else "OFF"))
+        cb.data = "adm:mverify"
+        return await admin_callbacks(cb, session, db_user, state, bot)
+    if action == "mvtests":
+        await cb.answer("Running…")
+        report = sanity_check_math()
+        log.info("math self test run by %s (FAIL present: %s)", actor, "FAIL" in report)
+        await edit(report, inline([[("⬅️ Math verification", "adm:mverify")], BACK_ADMIN])); return
     if action == "feat":
         if a2 in FEATURE_KEYS:
             cur = await feature_enabled(session, a2); await set_setting(session, f"feature:{a2}", "false" if cur else "true")
@@ -4545,52 +5211,40 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
     if action == "addexam":
         await state.set_state(AdminFlow.add_exam); await cb.answer(); await msg.answer("➕ Send the new exam name (e.g. <code>SSC CGL</code>). /cancel to abort."); return
     if action == "mock":
-        tests = list((await session.execute(select(MockTest).order_by(MockTest.id.desc()).limit(15))).scalars())
-        lines = ["📝 <b>Mock tests</b>", ""]
-        rows: list[list[tuple[str, str]]] = [[("➕ Create mock test", "adm:mockadd")]]
-        for t in tests:
-            n = len(await mock_servable_questions(session, t.id)); total = await admin_count(session, select(MockQuestion.id).where(MockQuestion.test_id == t.id))
-            lines.append(f"{'🟢' if t.published else '⚪️'} #{t.id} {esc(t.title)} — {n}/{total} approved · {t.duration} min")
-            rows.append([(f"{'📴' if t.published else '📶'} #{t.id} {t.title[:20]}", f"adm:mockpub:{t.id}"), (f"➕ add Qs #{t.id}", f"adm:mockq:{t.id}")])
-        rows.append(BACK_ADMIN); await cb.answer(); await edit("\n".join(lines), inline(rows)); return
+        text, kb = await mock_admin_screen(session); await cb.answer(); await edit(text, kb); return
     if action == "mockadd":
         await state.set_state(AdminFlow.mock_test); await state.update_data(step="create"); await cb.answer()
         await msg.answer("📝 Send: <code>Exam name | Test title | duration minutes</code>\nExample: <code>Bihar Police | Constable Set 1 | 30</code>. /cancel to abort."); return
     if action == "mockpub":
-        test_id = parse_int(a2, 0) or 0
-        t = await session.get(MockTest, test_id)
+        t = await session.get(MockTest, parse_int(a2, 0) or 0)
         if not t:
-            await cb.answer("Mock test not found.", show_alert=True)
-            return
-
-        # Refuse to publish a test without at least one approved, valid question.
-        if not t.published and len(await mock_servable_questions(session, t.id)) == 0:
-            await cb.answer("Cannot publish: attach at least one approved, valid question first.", show_alert=True)
-            return
-
+            await cb.answer("Mock test not found.", show_alert=True); return
+        if not t.published:
+            usable = len(await mock_servable_questions(session, t.id))
+            if usable == 0:
+                total = await admin_count(session, select(MockQuestion.id).where(MockQuestion.test_id == t.id))
+                await cb.answer(f"Cannot publish: {total} attached, 0 usable. Open 🔍 #{t.id} to see why.", show_alert=True); return
         t.published = not t.published
         await audit(session, actor, "mock.publish", str(t.id), str(t.published))
-        # Commit the toggle before rebuilding the admin UI, so the published state is durable.
-        await session.flush()
-        await session.commit()
-        await session.refresh(t)
+        await session.commit()      # make the toggle durable before the UI is rebuilt
         await cb.answer("Published ✅" if t.published else "Unpublished")
-
-        tests = list((await session.execute(
-            select(MockTest).order_by(MockTest.id.desc()).limit(15)
-        )).scalars())
-        rows = [[("➕ Create mock test", "adm:mockadd")]]
-        for x in tests:
-            icon = "📴" if x.published else "📶"
-            rows.append([(f"{icon} #{x.id} {x.title[:20]}", f"adm:mockpub:{x.id}"),
-                         (f"➕ add Qs #{x.id}", f"adm:mockq:{x.id}")])
-        rows.append(BACK_ADMIN)
-        status_lines = [
-            f"{'🟢 PUBLISHED' if x.published else '⚪️ UNPUBLISHED'} #{x.id} {esc(x.title)} · {x.duration} min"
-            for x in tests
-        ]
-        await edit("📝 <b>Mock tests</b>\\n\\n" + "\\n".join(status_lines), inline(rows))
-        return
+        text, kb = await mock_admin_screen(session); await edit(text, kb); return
+    if action == "mockinfo":
+        t = await session.get(MockTest, parse_int(a2, 0) or 0)
+        if not t: await cb.answer("Not found.", show_alert=True); return
+        ex = await session.get(Exam, t.exam_id)
+        mqs = list((await session.execute(select(MockQuestion).where(MockQuestion.test_id == t.id).order_by(MockQuestion.position))).scalars())
+        lines = [f"🔍 <b>{esc(t.title)}</b> (#{t.id}) — exam: {esc(ex.name if ex else t.exam_id)} · {'published' if t.published else 'unpublished'}", ""]
+        usable = 0
+        for mq in mqs:
+            q = await session.get(Question, mq.question_id)
+            reason = mock_attach_reason(q, t, set())
+            if reason is None: usable += 1
+            lines.append(f"{'✅' if reason is None else '⚠️'} Q#{mq.question_id}" + (f" — {esc(reason)}" if reason else f" — {esc((q.text or '')[:50])}"))
+        lines.append("")
+        lines.append(f"Usable: {usable}/{len(mqs)}" if mqs else "No questions attached yet.")
+        await cb.answer()
+        await edit("\n".join(lines[:60]), inline([[("➕ Add questions", f"adm:mockq:{t.id}")], [("⬅️ Mock tests", "adm:mock")], BACK_ADMIN])); return
     if action == "mockq":
         t = await session.get(MockTest, parse_int(a2, 0) or 0)
         if not t: await cb.answer("Not found.", show_alert=True); return
@@ -5125,32 +5779,60 @@ async def admin_mock_input(message: Message, session: AsyncSession, db_user: Use
         if len(p) != 3: await message.answer("Format: Exam name | Title | minutes"); return
         exam = (await session.execute(select(Exam).where(func.lower(Exam.name) == p[0].lower()))).scalar_one_or_none()
         mins = parse_int(p[2], None)
-        if not exam: await message.answer("Exam not found."); return
+        if not exam:
+            names = [e.name for e in (await session.execute(select(Exam).where(Exam.active.is_(True)).order_by(Exam.name))).scalars()]
+            await message.answer("Exam not found. Existing exams: " + esc(", ".join(names))); return
         if not mins or not (1 <= mins <= 300): await message.answer("Duration must be 1–300 minutes."); return
+        dup = (await session.execute(select(MockTest).where(MockTest.exam_id == exam.id, func.lower(MockTest.title) == p[1].lower()))).scalars().first()
+        if dup:        # repeated submission must not create a second test with the same title
+            await state.update_data(step="attach", test_id=dup.id)
+            await message.answer(f"ℹ️ Mock test <b>{esc(dup.title)}</b> already exists as #{dup.id}. Continuing with it — send question IDs or <code>auto 20</code>."); return
         t = MockTest(exam_id=exam.id, title=p[1][:160], duration=mins, published=False); session.add(t); await session.flush()
         await audit(session, message.from_user.id, "mock.create", str(t.id), t.title)
         await state.update_data(step="attach", test_id=t.id)
         await message.answer(f"✅ Created mock test #{t.id} (unpublished). Now send approved question IDs (e.g. <code>12 15 19</code>) or <code>auto 20</code>. /cancel when done."); return
     t = await session.get(MockTest, data.get("test_id") or 0)
     if not t: await state.clear(); await message.answer("Mock test not found."); return
+    exam = await session.get(Exam, t.exam_id)
+    exam_name = exam.name if exam else str(t.exam_id)
     txt = (message.text or "").strip().lower()
     existing = set((await session.execute(select(MockQuestion.question_id).where(MockQuestion.test_id == t.id))).scalars())
     pos = len(existing)
     if txt.startswith("auto"):
         n = parse_int(txt.split()[-1], 10) or 10
-        pool = [q for q in (await session.execute(select(Question).where(Question.exam_id == t.exam_id, Question.status == Q_APPROVED, Question.published.is_(True)))).scalars() if is_servable(q) and q.id not in existing]
+        pool = [q for q in (await session.execute(select(Question).where(Question.exam_id == t.exam_id, Question.status == Q_APPROVED, Question.published.is_(True)))).scalars()
+                if is_servable(q) and q.id not in existing]
+        if not pool:
+            await message.answer(f"No approved, valid, unattached questions exist for <b>{esc(exam_name)}</b>. "
+                                 "Approve questions in Question Bank first, or check that they belong to this exam."); return
         random.shuffle(pool); ids = [q.id for q in pool[:n]]
     else:
         ids = [int(x) for x in re.findall(r"\d+", txt)]
-    added, skipped = 0, []
-    for qid in ids:
+        if not ids:
+            await message.answer("Send numeric question IDs (e.g. <code>12 15 19</code>) or <code>auto 20</code>. /cancel when done."); return
+    added: list[int] = []
+    skipped: list[str] = []
+    for qid in dict.fromkeys(ids):
         q = await session.get(Question, qid)
-        if not q or q.exam_id != t.exam_id or not is_servable(q) or qid in existing:
-            skipped.append(qid); continue
-        session.add(MockQuestion(test_id=t.id, question_id=qid, position=pos)); pos += 1; existing.add(qid); added += 1
+        reason = mock_attach_reason(q, t, existing)
+        if reason:
+            skipped.append(f"#{qid} — {reason}"); continue
+        session.add(MockQuestion(test_id=t.id, question_id=qid, position=pos)); pos += 1; existing.add(qid); added.append(qid)
     await session.flush()
-    await message.answer(f"➕ Attached {added} question(s) to #{t.id} (total {pos})." + (f"\nSkipped (not approved / wrong exam / duplicate): {skipped[:20]}" if skipped else "") +
-                         "\nSend more IDs, or /cancel. Publish it from Admin → Mock tests.")
+    await session.commit()          # durable before the counts are reported
+    if added:
+        await audit(session, message.from_user.id, "mock.attach", str(t.id), ",".join(map(str, added)))
+    usable = len(await mock_servable_questions(session, t.id))
+    lines = [f"📝 <b>{esc(t.title)}</b> (#{t.id}) — exam: {esc(exam_name)}",
+             f"➕ Attached now: {len(added)}" + (f" ({', '.join('#' + str(i) for i in added[:20])})" if added else ""),
+             f"📊 Total attached: {pos} · usable in test: {usable}"]
+    if skipped:
+        lines += ["", "⚠️ Skipped:"] + [esc(s) for s in skipped[:20]]
+        if len(skipped) > 20: lines.append(f"…and {len(skipped) - 20} more")
+    lines.append("")
+    lines.append("Send more IDs, or /cancel. Publish from Admin → Mock tests." if usable
+                 else "Send more IDs, or /cancel. The test cannot be published until it has at least one usable question.")
+    await message.answer("\n".join(lines))
 
 
 @router.message(AdminFlow.api_key, F.text)
@@ -5452,9 +6134,10 @@ async def main():
         me = await bot.get_me()
         await register_commands(bot)
         log.info("Exam Yatra started as @%s (model %s, admins %s)", me.username, GEMINI_MODEL, sorted(ADMIN_IDS))
-        # drop_pending_updates avoids replaying a backlog after a redeploy; a second instance with the same token
-        # would raise TelegramConflictError — run exactly one instance.
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), close_bot_session=True, drop_pending_updates=False)
+        # DROP_PENDING_UPDATES=true skips the backlog accumulated while the service was down (default: process it).
+        # A second instance with the same token raises TelegramConflictError — run exactly one instance.
+        drop_backlog = os.getenv("DROP_PENDING_UPDATES", "false").lower() in ("1", "true", "yes")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), close_bot_session=True, drop_pending_updates=drop_backlog)
     except TelegramUnauthorizedError:
         log.error("Telegram rejected BOT_TOKEN. Check the token from @BotFather."); raise
     finally:
