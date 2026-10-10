@@ -886,9 +886,16 @@ def html_to_plain(text: str) -> str:
 
 
 def clean_plain(value: Any) -> str:
+    """Strip Markdown decoration from model text WITHOUT corrupting maths: a lone `*` between operands becomes ×,
+    and single underscores (subscripts such as x_1) survive. Only paired emphasis markers, code ticks and heading
+    hashes are removed."""
     s = str(value or "").strip()
     s = re.sub(r"```.*?```", "", s, flags=re.S)
-    s = re.sub(r"[*_`#]+", "", s)
+    s = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: m.group(1) or m.group(2), s, flags=re.S)
+    s = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", s)       # *italic*
+    s = re.sub(r"(?<=[\w)\]])\s*\*\s*(?=[\w(\[])", " × ", s)                  # 12 * 3 → 12 × 3 (keeps products readable)
+    s = re.sub(r"`+", "", s)
+    s = re.sub(r"^\s*#{1,6}\s*", "", s, flags=re.M)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -1771,6 +1778,8 @@ ANSWER_SCHEMA = {
     "properties": {
         "question": {"type": "STRING"}, "answer": {"type": "STRING"}, "explanation": {"type": "STRING"},
         "steps": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "given": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "formulas": {"type": "ARRAY", "items": {"type": "STRING"}},
         "confidence": {"type": "STRING", "description": "high | medium | low"},
     },
     "required": ["answer"],
@@ -1799,8 +1808,11 @@ def build_answer_prompt(question_text: str, style: str, lang: str, *, with_image
         guide = ("Return ONLY the direct answer in 'answer' (value, name, option letter + text, or one short sentence; max 25 words). "
                  "At most one short sentence in 'explanation'. Leave 'steps' empty.")
     else:
-        guide = ("Fill 'question' with a one-line restatement, 'answer' with the direct final answer (max 30 words), 'steps' with 2-15 "
-                 "short solution steps (formulas/examples where relevant) and 'explanation' with one or two sentences of the key concept.")
+        guide = ("Teacher-style solution. Fill 'question' with a one-line restatement only if helpful. For numerical/problem questions fill "
+                 "'given' (one known value or condition per item) and 'formulas' (one formula per item). Put 2-15 meaningful, logically ordered "
+                 "solution steps in 'steps', one equation or action per step, verifying intermediate values. Use 'explanation' for the key concept in "
+                 "one or two simple sentences. 'answer' is the final answer only (max 30 words) including units, or the correct MCQ option letter and "
+                 "its text. Leave 'given' and 'formulas' empty for theory questions; never add filler. For an MCQ, make sure the chosen option matches your working.")
     return (f"{base}\n\nAnswer in {lang_name}. Plain text in every field — no Markdown, no HTML or LaTeX. Write formulas with readable Unicode symbols and one formula per line. If you are not sure of the fact, "
             f"say so and set confidence to 'low' instead of guessing.\n{guide}")
 
@@ -1816,18 +1828,24 @@ def render_structured_answer(data: dict[str, Any], style: str, lang: str) -> str
         if explanation and len(answer) < 60 and len(explanation) <= 220 and explanation.lower() != answer.lower():
             text += f"\n\n{esc(explanation)}"
         return text + note
-    q_label, a_label, e_label = (("प्रश्न", "अंतिम उत्तर", "व्याख्या") if lang == "hi" else ("Question", "Final Answer", "Explanation"))
-    parts: list[str] = []
+    hi = lang == "hi"
+    title, q_label, g_label, f_label, s_label, e_label, a_label = (
+        ("📘 <b>हल / उत्तर</b>", "प्रश्न", "दिया गया", "सूत्र", "चरण-दर-चरण हल", "अवधारणा", "अंतिम उत्तर") if hi else
+        ("📘 <b>Solution</b>", "Question", "Given", "Formula", "Step-by-step solution", "Concept", "Final Answer"))
+    given = [clean_plain(g) for g in (data.get("given") if isinstance(data.get("given"), list) else []) if clean_plain(g)]
+    formulas = [clean_plain(f) for f in (data.get("formulas") if isinstance(data.get("formulas"), list) else []) if clean_plain(f)]
+    parts: list[str] = [title]
     if question:
-        parts.append(f"📘 <b>{q_label}:</b> {esc(question)}")
-    parts.append(f"✅ <b>{a_label}:</b> {esc(answer)}")
-    body: list[str] = []
+        parts.append(f"<b>{q_label}:</b> {esc(question)}")
+    if given:
+        parts.append(f"<b>{g_label}:</b>\n" + "\n".join(f"• {esc(g)}" for g in given))
+    if formulas:
+        parts.append(f"<b>{f_label}:</b>\n" + "\n".join(f"<code>{esc(f)}</code>" for f in formulas))
     if steps:
-        body.append("\n".join(f"{i}. {esc(s)}" for i, s in enumerate(steps, 1)))
+        parts.append(f"<b>{s_label}:</b>\n" + "\n".join(f"{i}. {esc(s)}" for i, s in enumerate(steps, 1)))
     if explanation:
-        body.append(esc(explanation))
-    if body:
-        parts.append(f"<b>{e_label}:</b>\n" + "\n\n".join(body))
+        parts.append(f"<b>{e_label}:</b> {esc(explanation)}")
+    parts.append(f"✅ <b>{a_label}:</b> {esc(answer)}")      # final answer last, as in a worked solution
     return "\n\n".join(parts) + note
 
 
@@ -1875,7 +1893,8 @@ FRIENDLY_AI_ERROR = {
 
 def answer_style_keyboard(style: str, lang: str, retry: bool = False) -> InlineKeyboardMarkup:
     if retry:
-        return inline([[("🔁 Retry", "ans:retry")], [("🏠 Home", "menu:home"), ("📨 Contact admin", "info:contact")]])
+        retry_op = "long" if style == STYLE_DETAILED else "short"
+        return inline([[("🔁 Retry", f"ans:{retry_op}")], [("🏠 Home", "menu:home"), ("📨 Contact admin", "info:contact")]])
     short_lbl = ("⚡ छोटा उत्तर" if lang == "hi" else "⚡ Short Answer") + (" ✅" if style == STYLE_SHORT else "")
     long_lbl = ("📘 विस्तार से" if lang == "hi" else "📘 Long Answer") + (" ✅" if style == STYLE_DETAILED else "")
     lang_row = [("🌐 In English", "ans:lang:en")] if lang == "hi" else [("🇮🇳 हिन्दी में", "ans:lang:hi")]
@@ -3728,7 +3747,14 @@ async def admin_payment_decision(cb: CallbackQuery, session: AsyncSession, db_us
     if action == "approve":
         if req.validity_days < 0:
             await cb.answer("Plan validity is not configured — fix Payment Settings first.", show_alert=True); return
-        req.status = PAY_APPROVED; req.decided_at = now_utc(); req.decided_by = cb.from_user.id
+        # Atomic compare-and-set: two near-simultaneous clicks (or two admins) can both pass the status check above,
+        # because each runs in its own session. Only the click whose UPDATE actually flips pending → approved may activate.
+        claimed = await session.execute(update(PaymentRequest).where(PaymentRequest.id == req.id, PaymentRequest.status == PAY_PENDING)
+                                        .values(status=PAY_APPROVED, decided_at=now_utc(), decided_by=cb.from_user.id))
+        if claimed.rowcount != 1:
+            await session.rollback()
+            await cb.answer("Already decided by another click.", show_alert=True); return
+        await session.refresh(req)
         await activate_subscription(session, user, req.plan_name, req.validity_days, cb.from_user.id, f"payment #{req.id}")
         await audit(session, cb.from_user.id, "payment.approve", str(req.id), f"user {user.telegram_id}")
         await session.commit()        # entitlement + payment status land together or not at all
@@ -6109,6 +6135,51 @@ async def notify_startup_warnings(bot: Bot) -> None:
                 pass
 
 
+POLL_STATE: dict[str, Any] = {"conflict_at": None, "conflict_count": 0}
+
+
+class ConflictLogHandler(logging.Handler):
+    """aiogram's polling loop logs getUpdates failures and retries with back-off instead of raising them, so the
+    `except TelegramConflictError` in main() can miss a duplicate poller. This handler records the conflict so /health
+    and the admin alert can report it honestly instead of claiming the bot is running normally."""
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return
+        if "TelegramConflictError" in msg or "terminated by other getUpdates" in msg:
+            POLL_STATE["conflict_at"] = time.time()
+            POLL_STATE["conflict_count"] = int(POLL_STATE["conflict_count"]) + 1
+
+
+def polling_conflict_active(window: float = 300.0) -> bool:
+    at = POLL_STATE.get("conflict_at")
+    return bool(at) and time.time() - float(at) < window
+
+
+async def conflict_watchdog(bot: Bot, stop: asyncio.Event) -> None:
+    """Tell admins (at most every 15 minutes) when another process is polling with the same token."""
+    last_alert = 0.0
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            pass
+        if stop.is_set():
+            break
+        if polling_conflict_active() and time.time() - last_alert > CONFIG_ALERT_INTERVAL:
+            last_alert = time.time()
+            log.error("POLLING CONFLICT: another process is using this BOT_TOKEN. This instance is NOT receiving updates reliably.")
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, "🚨 <b>Polling conflict</b>\nAnother process is polling Telegram with this bot token, "
+                                           "so this instance cannot receive updates reliably. Stop other Render services, old deployments, "
+                                           "Termux/local copies, then redeploy exactly one instance.")
+                except TelegramAPIError:
+                    pass
+
+
+
 def validate_startup_config() -> None:
     problems = []
     if not BOT_TOKEN or ":" not in BOT_TOKEN:
@@ -6140,40 +6211,46 @@ async def main():
     dp.errors.register(on_error)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     stop = asyncio.Event()
+    logging.getLogger("aiogram").addHandler(ConflictLogHandler())
     expiry_task = asyncio.create_task(expiry_loop(bot, stop))
+    watchdog_task = asyncio.create_task(conflict_watchdog(bot, stop))
 
     async def health(_request):
-        return web.json_response({"status": "ok", "service": "ExamYatra", "time": now_utc().isoformat()})
+        conflict = polling_conflict_active()
+        return web.json_response({"status": "degraded" if conflict else "ok", "service": "ExamYatra",
+                                  "polling": "conflict" if conflict else "ok", "time": now_utc().isoformat()})
     app = web.Application(); app.router.add_get("/", health); app.router.add_get("/health", health)
     runner = web.AppRunner(app); await runner.setup()
     port = int(os.getenv("PORT", "10000"))
     await web.TCPSite(runner, host="0.0.0.0", port=port).start()
     log.info("Health server listening on 0.0.0.0:%s", port)
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        drop_backlog = os.getenv("DROP_PENDING_UPDATES", "false").lower() in ("1", "true", "yes")
+        await bot.delete_webhook(drop_pending_updates=drop_backlog)
         me = await bot.get_me()
         await register_commands(bot)
         await notify_startup_warnings(bot)
         log.info("Exam Yatra started as @%s (model %s, admins %s)", me.username, GEMINI_MODEL, sorted(ADMIN_IDS))
         # DROP_PENDING_UPDATES=true skips the backlog accumulated while the service was down (default: process it).
         # A second instance with the same token raises TelegramConflictError — run exactly one instance.
-        drop_backlog = os.getenv("DROP_PENDING_UPDATES", "false").lower() in ("1", "true", "yes")
+        log.info("Pending Telegram updates will be %s on startup (DROP_PENDING_UPDATES=%s).", "DISCARDED" if drop_backlog else "processed", drop_backlog)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(dp.stop_polling()))
             except (NotImplementedError, RuntimeError):
                 pass
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), close_bot_session=False, drop_pending_updates=True)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), close_bot_session=False, drop_pending_updates=drop_backlog)
     except TelegramConflictError:
         log.error("Another process is polling with this BOT_TOKEN. Stop every other Render service, local process, Termux copy or old deployment, then restart this one.")
         raise
     except TelegramUnauthorizedError:
         log.error("Telegram rejected BOT_TOKEN. Check the token from @BotFather."); raise
     finally:
-        stop.set(); expiry_task.cancel()
-        try: await expiry_task
-        except (asyncio.CancelledError, Exception): pass
+        stop.set(); expiry_task.cancel(); watchdog_task.cancel()
+        for _t in (expiry_task, watchdog_task):
+            try: await _t
+            except (asyncio.CancelledError, Exception): pass
         await runner.cleanup()
         await bot.session.close()
         await engine.dispose()
