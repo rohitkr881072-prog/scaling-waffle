@@ -1781,6 +1781,8 @@ ANSWER_SCHEMA = {
         "given": {"type": "ARRAY", "items": {"type": "STRING"}},
         "formulas": {"type": "ARRAY", "items": {"type": "STRING"}},
         "confidence": {"type": "STRING", "description": "high | medium | low"},
+        "kind": {"type": "STRING", "description": "math | list | mcq | factual | theory"},
+        "items": {"type": "ARRAY", "items": {"type": "STRING"}},
     },
     "required": ["answer"],
 }
@@ -1808,44 +1810,83 @@ def build_answer_prompt(question_text: str, style: str, lang: str, *, with_image
         guide = ("Return ONLY the direct answer in 'answer' (value, name, option letter + text, or one short sentence; max 25 words). "
                  "At most one short sentence in 'explanation'. Leave 'steps' empty.")
     else:
-        guide = ("Teacher-style solution. Fill 'question' with a one-line restatement only if helpful. For numerical/problem questions fill "
-                 "'given' (one known value or condition per item) and 'formulas' (one formula per item). Put 2-15 meaningful, logically ordered "
-                 "solution steps in 'steps', one equation or action per step, verifying intermediate values. Use 'explanation' for the key concept in "
-                 "one or two simple sentences. 'answer' is the final answer only (max 30 words) including units, or the correct MCQ option letter and "
-                 "its text. Leave 'given' and 'formulas' empty for theory questions; never add filler. For an MCQ, make sure the chosen option matches your working.")
+        guide = ("Set 'kind' to ONE of: math (any calculation/derivation in maths, physics, chemistry), list (word meanings, translations, "
+                 "lists, tables), mcq, factual (definition, fact, short explanation), theory. Choose the format that fits; never force a template.\n"
+                 "- kind=math: put 3-6 meaningful transformations in 'steps' (more only if the problem truly needs it, e.g. calculus or identities), "
+                 "ONE equation per step, no prose narration, no restating the question. Skip trivial algebra such as 'expand the left side'. Leave "
+                 "'given', 'formulas', 'question', 'explanation' empty unless essential. The last step must equal 'answer'; 'answer' is the final "
+                 "simplified result with units. Re-check every sign before answering. Never invent an identity.\n"
+                 "- kind=list: put ONE entry per element of 'items' (for word meanings: 'English word : Hindi meaning'), exactly the number "
+                 "requested, no duplicates, age-appropriate for the stated class. No numbering inside items. Leave 'steps' empty and 'answer' "
+                 "a one-line title or empty.\n"
+                 "- kind=mcq: 'answer' = correct option letter + text; 'explanation' = one or two sentences on why. No steps.\n"
+                 "- kind=factual/theory: 'answer' = direct answer; 'explanation' = a short clear explanation (max about 6 sentences). No steps, "
+                 "no filler.")
     return (f"{base}\n\nAnswer in {lang_name}. Plain text in every field — no Markdown, no HTML or LaTeX. Write formulas with readable Unicode symbols and one formula per line. If you are not sure of the fact, "
             f"say so and set confidence to 'low' instead of guessing.\n{guide}")
+
+
+def _norm_math(t: str) -> str:
+    t = (t or "").replace("−", "-").replace("–", "-").replace("×", "*").replace("·", "*")
+    return re.sub(r"[\s*]+", "", t).lower()
+
+
+def _clean_items(raw: Any) -> list[str]:
+    """Normalise list entries: strip numbering/bullets the model added, drop empties and case-insensitive duplicates."""
+    out: list[str] = []; seen: set[str] = set()
+    for it in raw if isinstance(raw, list) else []:
+        line = clean_plain(it)
+        line = re.sub(r"^\s*(?:\d{1,3}\s*[.)]|[-•*])\s*", "", line).strip()
+        if not line:
+            continue
+        key = re.split(r"\s*[:：=–—-]\s*", line, maxsplit=1)[0].strip().lower()
+        if key in seen:
+            continue
+        seen.add(key); out.append(line)
+    return out
 
 
 def render_structured_answer(data: dict[str, Any], style: str, lang: str) -> str:
     answer = clean_plain(data.get("answer")); explanation = clean_plain(data.get("explanation"))
     question = clean_plain(data.get("question")); confidence = clean_plain(data.get("confidence")).lower()
+    kind = clean_plain(data.get("kind")).lower()
     steps_raw = data.get("steps") if isinstance(data.get("steps"), list) else []
     steps = [clean_plain(s) for s in steps_raw if clean_plain(s)]
+    items = _clean_items(data.get("items"))
     note = "\n\n⚠️ <i>Low confidence — please verify this answer from a standard source.</i>" if confidence == "low" else ""
+    # A list request is always shown as a list (one entry per line), in Short and Long mode alike.
+    if items:
+        head = f"📘 <b>{esc(answer)}</b>\n\n" if answer and len(answer) <= 120 else ""
+        return head + "\n".join(f"{i}. {esc(it)}" for i, it in enumerate(items, 1)) + note
     if style == STYLE_SHORT:
         text = f"✅ <b>{esc(answer)}</b>"
         if explanation and len(answer) < 60 and len(explanation) <= 220 and explanation.lower() != answer.lower():
             text += f"\n\n{esc(explanation)}"
         return text + note
     hi = lang == "hi"
-    title, q_label, g_label, f_label, s_label, e_label, a_label = (
-        ("📘 <b>हल / उत्तर</b>", "प्रश्न", "दिया गया", "सूत्र", "चरण-दर-चरण हल", "अवधारणा", "अंतिम उत्तर") if hi else
-        ("📘 <b>Solution</b>", "Question", "Given", "Formula", "Step-by-step solution", "Concept", "Final Answer"))
+    title, g_label, f_label, a_label = (("📘 <b>हल</b>", "दिया गया", "सूत्र", "अंतिम उत्तर") if hi else
+                                         ("📘 <b>Solution</b>", "Given", "Formula", "Final Answer"))
     given = [clean_plain(g) for g in (data.get("given") if isinstance(data.get("given"), list) else []) if clean_plain(g)]
     formulas = [clean_plain(f) for f in (data.get("formulas") if isinstance(data.get("formulas"), list) else []) if clean_plain(f)]
-    parts: list[str] = [title]
-    if question:
-        parts.append(f"<b>{q_label}:</b> {esc(question)}")
-    if given:
-        parts.append(f"<b>{g_label}:</b>\n" + "\n".join(f"• {esc(g)}" for g in given))
-    if formulas:
-        parts.append(f"<b>{f_label}:</b>\n" + "\n".join(f"<code>{esc(f)}</code>" for f in formulas))
-    if steps:
-        parts.append(f"<b>{s_label}:</b>\n" + "\n".join(f"{i}. {esc(s)}" for i, s in enumerate(steps, 1)))
-    if explanation:
-        parts.append(f"<b>{e_label}:</b> {esc(explanation)}")
-    parts.append(f"✅ <b>{a_label}:</b> {esc(answer)}")      # final answer last, as in a worked solution
+    if steps:                                                   # worked solution: equations on separate lines, no fake numbering
+        parts: list[str] = [title]
+        if given:
+            parts.append(f"<b>{g_label}:</b> " + "; ".join(esc(g) for g in given))
+        if formulas:
+            parts.append(f"<b>{f_label}:</b>\n" + "\n".join(f"<code>{esc(f)}</code>" for f in formulas))
+        parts.append("\n".join(f"<code>{esc(st)}</code>" if re.search(r"[=≈<>≤≥]", st) else esc(st) for st in steps))
+        if explanation and kind not in ("math",):
+            parts.append(esc(explanation))
+        parts.append(f"✅ <b>{a_label}:</b> {esc(answer)}")
+        # Consistency guard: the displayed final answer must appear in the last derivation line; otherwise never imply it is checked.
+        na, nl = _norm_math(answer), _norm_math(steps[-1])
+        if kind == "math" and na and re.search(r"[=0-9]", na) and na not in nl and nl not in na:
+            note = "\n\n⚠️ <i>The final line and the last step differ — please verify this result.</i>" + note
+        return "\n\n".join(parts) + note
+    # No derivation: factual / theory / MCQ — answer first, short explanation, no template headings.
+    parts = [f"✅ <b>{esc(answer)}</b>"]
+    if explanation and explanation.lower() != answer.lower():
+        parts.append(esc(explanation))
     return "\n\n".join(parts) + note
 
 
@@ -4710,43 +4751,62 @@ def pdf_fonts_available() -> bool:
 
 
 def _pdf_safe(text: str) -> str:
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", text or "")
+    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]", "", text or "")
+
+
+_LATIN_MAP = {"\u2014": "-", "\u2013": "-", "\u2012": "-", "\u2212": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+              "\u2026": "...", "\u00d7": "x", "\u20b9": "Rs ", "\u2714": "[OK]", "\u2718": "[X]", "\u2022": "-", "\u00b7": "-"}
+
+
+def _pdf_latin(text: str) -> str:
+    """Helvetica (core font) can only encode Latin-1: map common symbols, replace the rest so fpdf2 never raises."""
+    t = _pdf_safe(text)
+    for k, v in _LATIN_MAP.items():
+        t = t.replace(k, v)
+    return t.encode("latin-1", "replace").decode("latin-1")
+
+
+def _pdf_wrap_long(text: str, width: int = 60) -> str:
+    """fpdf2 raises 'Not enough horizontal space' for an unbreakable word wider than the cell: break very long tokens."""
+    return re.sub(r"(\S{%d})(?=\S)" % width, r"\1 ", text or "")
 
 
 def build_result_pdf(test: AiTest, questions: list[AiTestQuestion], student: str) -> bytes:
     """Synchronous — run via asyncio.to_thread. Uses Noto fonts from ./fonts with HarfBuzz shaping; if fonts are
-    missing it still produces a Latin-only PDF (Hindi would be unreadable) — the caller warns the user in that case."""
+    missing (or fail to load) it still produces a Latin-only PDF (Hindi would be unreadable) — the caller warns the user."""
     from fpdf import FPDF
 
     unicode_ok = pdf_fonts_available()
+    FAM = "Helvetica"
+    txt = lambda s: _pdf_wrap_long(_pdf_latin(s))   # noqa: E731
 
     class ResultPDF(FPDF):
         def header(self):
             self.set_font(FAM, "B", 9); self.set_text_color(120, 120, 120)
-            self.cell(0, 6, "Exam Yatra — Result Report", new_x="LMARGIN", new_y="NEXT", align="R")
+            self.cell(0, 6, txt("Exam Yatra - Result Report"), new_x="LMARGIN", new_y="NEXT", align="R")
             self.set_text_color(0, 0, 0)
 
         def footer(self):
             self.set_y(-12); self.set_font(FAM, "", 8); self.set_text_color(120, 120, 120)
-            self.cell(0, 6, f"Page {self.page_no()} / {{nb}}   ·   Generated by Exam Yatra bot", align="C")
+            self.cell(0, 6, f"Page {self.page_no()} / {{nb}}   -   Generated by Exam Yatra bot", align="C")
 
     pdf = ResultPDF(orientation="P", unit="mm", format="A4")
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=16)
     if unicode_ok:
-        FAM = "NotoSans"
-        for fam, (reg, bold) in FONT_FILES.items():
-            pdf.add_font(fam, "", os.path.join(FONT_DIR, reg))
-            pdf.add_font(fam, "B", os.path.join(FONT_DIR, bold))
-        pdf.set_fallback_fonts(["NotoSansDevanagari"])
         try:
-            pdf.set_text_shaping(True)
-        except Exception as e:                      # uharfbuzz missing → still Unicode, but conjuncts may render unshaped
-            log.warning("Text shaping unavailable: %r", e)
-        txt = _pdf_safe
-    else:
-        FAM = "Helvetica"
-        txt = lambda s: _pdf_safe(s).encode("latin-1", "replace").decode("latin-1")  # noqa: E731
+            for fam, (reg, bold) in FONT_FILES.items():
+                pdf.add_font(fam, "", os.path.join(FONT_DIR, reg))
+                pdf.add_font(fam, "B", os.path.join(FONT_DIR, bold))
+            pdf.set_fallback_fonts(["NotoSansDevanagari"])
+            try:
+                pdf.set_text_shaping(True)
+            except Exception as e:                  # uharfbuzz missing -> still Unicode, conjuncts may render unshaped
+                log.warning("Text shaping unavailable: %r", e)
+            FAM = "NotoSans"
+            txt = lambda s: _pdf_wrap_long(_pdf_safe(s))   # noqa: E731
+        except Exception:
+            log.exception("Noto fonts could not be loaded - falling back to Helvetica (Latin only)")
     W = pdf.w - pdf.l_margin - pdf.r_margin
     exam, subject, topic = test_parts(test)
     pdf.add_page()
@@ -4833,31 +4893,37 @@ async def test_pdf(cb: CallbackQuery, session: AsyncSession, db_user: User, bot:
     if db_user.id in PDF_JOBS:
         await cb.answer("Your previous PDF is still being prepared…", show_alert=True); return
     await cb.answer("📄 Preparing your PDF…")
-    questions = await load_test_questions(session, test)
-    PDF_JOBS.add(db_user.id)
-    note = await cb.message.answer("📄 Generating your result PDF…")
+    PDF_JOBS.add(db_user.id)                       # released in the finally block below on EVERY path
+    note = None
     try:
-        data = await asyncio.to_thread(build_result_pdf, test, questions, db_user.full_name)
-    except Exception as e:
-        log.exception("PDF generation failed for test %s", test.id)
-        PDF_JOBS.discard(db_user.id)
-        await safe_edit(note, "⚠️ Sorry, the PDF could not be generated right now. Please try again later."); return
-    PDF_JOBS.discard(db_user.id)
-    if len(data) > 49 * 1024 * 1024:
-        await safe_edit(note, "⚠️ The PDF is too large to send via Telegram."); return
-    safe_topic = re.sub(r"[^\w\u0900-\u097F-]+", "_", test.topic)[:40].strip("_") or "test"
-    fname = f"ExamYatra_Result_{safe_topic}_{(test.completed_at or test.created_at).strftime('%Y%m%d')}.pdf"
-    caption = f"📄 <b>Result Report</b> — {esc(test.topic)}\n🎯 {test.correct}/{test.question_count} · {test.accuracy:.0f}%"
-    if not pdf_fonts_available():
-        caption += "\n\n⚠️ <i>Hindi text may not display: the server is missing the Noto fonts (fonts/ folder). Admin has been informed in the logs.</i>"
-        log.warning("fonts/ folder missing Noto TTFs — Hindi PDFs will be unreadable")
-    try:
-        await cb.message.answer_document(BufferedInputFile(data, filename=fname), caption=caption)
+        questions = await load_test_questions(session, test)
+        note = await cb.message.answer("📄 Generating your result PDF…")
+        try:
+            data = await asyncio.wait_for(asyncio.to_thread(build_result_pdf, test, questions, db_user.full_name), timeout=90)
+        except Exception:
+            log.exception("PDF generation failed for test %s (user %s)", test.id, db_user.telegram_id)
+            await safe_edit(note, "⚠️ Sorry, the PDF could not be generated right now. Please try again later."); return
+        if not data or not data.startswith(b"%PDF"):
+            log.error("PDF generation returned invalid data for test %s", test.id)
+            await safe_edit(note, "⚠️ Sorry, the PDF could not be generated right now. Please try again later."); return
+        if len(data) > 49 * 1024 * 1024:
+            await safe_edit(note, "⚠️ The PDF is too large to send via Telegram."); return
+        safe_topic = re.sub(r"[^\w\u0900-\u097F-]+", "_", test.topic)[:40].strip("_") or "test"
+        fname = f"ExamYatra_Result_{safe_topic}_{(test.completed_at or test.created_at).strftime('%Y%m%d')}.pdf"
+        caption = f"📄 <b>Result Report</b> — {esc(test.topic)}\n🎯 {test.correct}/{test.question_count} · {test.accuracy:.0f}%"
+        if not pdf_fonts_available():
+            caption += "\n\n⚠️ <i>Hindi text may not display: the server is missing the Noto fonts (fonts/ folder). Admin has been informed in the logs.</i>"
+            log.warning("fonts/ folder missing Noto TTFs — Hindi PDFs will be unreadable")
+        try:
+            await cb.message.answer_document(BufferedInputFile(data, filename=fname), caption=caption)
+        except TelegramAPIError:
+            log.exception("Telegram rejected result PDF for test %s", test.id)
+            await safe_edit(note, "⚠️ The result file could not be sent right now. Please try again."); return
         await try_delete(note)
+        note = None
         await audit(session, db_user.telegram_id, "test.pdf", str(test.id), fname)
-    except TelegramAPIError as e:
-        await safe_edit(note, "⚠️ The result file could not be sent right now. Please try again.")
-
+    finally:
+        PDF_JOBS.discard(db_user.id)
 
 
 @router.callback_query(F.data.startswith("adm:"))
