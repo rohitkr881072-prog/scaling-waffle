@@ -804,6 +804,10 @@ TIER_LABEL = {"free": "Free (no active plan)", "trial": "Free Trial", "premium":
 
 
 async def effective_limits(session: AsyncSession, user: User) -> dict[str, int]:
+    # Admin's one-click free mode bypasses every quota for all non-banned users.
+    # Feature switches, access grants and maintenance mode remain separate safety controls.
+    if await setting_bool(session, "free_mode_enabled", False) and not user.is_admin:
+        return {key: -1 for key in LIMIT_KEYS}
     tier = user_tier(user)
     limits = dict((await load_policies(session))[tier])
     limits.update(user.overrides())     # per-user admin overrides take precedence
@@ -1822,7 +1826,8 @@ def build_answer_prompt(question_text: str, style: str, lang: str, *, with_image
                  "- kind=mcq: 'answer' = correct option letter + text; 'explanation' = one or two sentences on why. No steps.\n"
                  "- kind=factual/theory: 'answer' = direct answer; 'explanation' = a short clear explanation (max about 6 sentences). No steps, "
                  "no filler.")
-    return (f"{base}\n\nAnswer in {lang_name}. Plain text in every field — no Markdown, no HTML or LaTeX. Write formulas with readable Unicode symbols and one formula per line. If you are not sure of the fact, "
+    language_lock = ("STRICT LANGUAGE RULE: Every natural-language value in answer, explanation, steps, given, formulas and items MUST be in Hindi written in Devanagari. English may appear only in proper nouns, standard technical terms where translation would be misleading, and mathematical notation. Do not answer in English. " if lang == "hi" else "STRICT LANGUAGE RULE: Every natural-language value in answer, explanation, steps, given, formulas and items MUST be in English. Do not answer in Hindi. ")
+    return (f"{base}\n\n{language_lock}Answer in {lang_name}. Plain text in every field — no Markdown, no HTML or LaTeX. Write formulas with readable Unicode symbols and one formula per line. If you are not sure of the fact, "
             f"say so and set confidence to 'low' instead of guessing.\n{guide}")
 
 
@@ -1981,6 +1986,20 @@ async def answer_student_question(message: Message, session: AsyncSession, user:
     prompt = build_answer_prompt(question_text, style, lang, with_image=bool(image_bytes), caption=caption)
     data, err = await ai_generate_json(prompt, ANSWER_SCHEMA, api_key, image_bytes=image_bytes, mime_type=mime_type,
                                        system=EXAM_YATRA_SYSTEM, temperature=0.2, max_tokens=2048 if style == STYLE_SHORT else 8192)
+    # Guard against occasional model language drift: request a translation of the structured fields,
+    # preserving equations, numbers, units, option labels and scientific terminology.
+    if lang == "hi" and isinstance(data, dict):
+        lang_probe = " ".join(str(data.get(k, "")) for k in ("answer", "explanation"))
+        lang_probe += " " + " ".join(str(x) for k in ("steps", "given", "formulas", "items") for x in (data.get(k) if isinstance(data.get(k), list) else []))
+        if lang_probe.strip() and not has_devanagari(lang_probe):
+            translation_prompt = ("Translate all natural-language strings in this JSON into clear, simple Hindi in Devanagari. "
+                                  "Keep the exact JSON schema and keys. Preserve every equation, number, unit, option letter, proper noun and scientific symbol unchanged. "
+                                  "Do not solve again or add/remove facts. Source JSON:\n" + json.dumps(data, ensure_ascii=False))
+            translated, tr_err = await ai_generate_json(translation_prompt, ANSWER_SCHEMA, api_key,
+                system=EXAM_YATRA_SYSTEM + " Strictly output Hindi (Devanagari) for all natural language; preserve maths exactly.",
+                temperature=0.0, max_tokens=8192)
+            if isinstance(translated, dict) and clean_plain(translated.get("answer")) and has_devanagari(clean_plain(translated.get("answer"))):
+                data = translated
     # Re-check that the user still may receive the result (ban/revoke during the slow call).
     await session.refresh(user)
     if user.status == "banned" or (not user.access_granted and not user.is_admin):
@@ -4458,12 +4477,14 @@ async def plan_screen(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]
     text = ("⭐ <b>Plan & Payment Settings</b>\n\n"
             f"Plan name: <b>{esc(p['name'])}</b>\nPrice: <b>₹{p['price']:.2f}</b>\nValidity: <b>{validity_label(p['validity_days'])}</b>\n"
             f"UPI ID: <code>{esc(p['upi_id']) or '—'}</code>\nPayee name: {esc(p['payee']) or '—'}\nPurchases: {'enabled' if p['purchases_enabled'] else 'DISABLED'}\n"
-            f"Trial: {'enabled' if await setting_bool(session, 'trial_enabled', True) else 'disabled'} · {await setting_int(session, 'trial_days', 7)} days\n\n" + "\n".join(warn))
+            f"Trial: {'enabled' if await setting_bool(session, 'trial_enabled', True) else 'disabled'} · {await setting_int(session, 'trial_days', 7)} days\n"
+            f"Unlimited free mode: {'ON — all usage limits bypassed' if await setting_bool(session, 'free_mode_enabled', False) else 'OFF'}\n\n" + "\n".join(warn))
     kb = inline([
         [("✏️ Plan name", "adm:set:plan_name"), ("💰 Price", "adm:set:plan_price")],
         [("📆 Validity (days, 0=lifetime)", "adm:set:plan_validity_days")],
         [("🏦 UPI ID", "adm:set:upi_id"), ("👤 Payee name", "adm:set:upi_payee")],
         [("🛒 Toggle purchases", "adm:toggle:purchases_enabled"), ("🎁 Toggle trial", "adm:toggle:trial_enabled")],
+        [(("🛑 Disable unlimited free mode" if await setting_bool(session, "free_mode_enabled", False) else "🆓 Enable unlimited free mode"), "adm:freemode")],
         [("🎁 Trial days", "adm:set:trial_days"), ("👁 Preview payment screen", "adm:plan:preview")],
         BACK_ADMIN])
     return text, kb
@@ -4746,12 +4767,46 @@ FONT_FILES = {"NotoSans": ("NotoSans-Regular.ttf", "NotoSans-Bold.ttf"),
 PDF_JOBS: set[int] = set()
 
 
+def ensure_pdf_fonts() -> bool:
+    """Fetch the open-source Noto fonts on first PDF use so Hindi never silently becomes question marks.
+    The Render filesystem must permit writes; failure is logged and reported by the caller."""
+    if pdf_fonts_available():
+        return True
+    import urllib.request
+    os.makedirs(FONT_DIR, exist_ok=True)
+    # Google Fonts' official repository. The Devanagari font also contains Latin glyphs.
+    url = "https://github.com/google/fonts/raw/refs/heads/main/ofl/notosansdevanagari/NotoSansDevanagari%5Bwdth,wght%5D.ttf"
+    target = os.path.join(FONT_DIR, "NotoSansDevanagari-Regular.ttf")
+    try:
+        if not os.path.exists(target):
+            req = urllib.request.Request(url, headers={"User-Agent": "ExamYatra/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as response, open(target, "wb") as out:
+                out.write(response.read())
+        # Reuse the variable font for regular/bold and Latin/Devanagari family slots.
+        for name in ("NotoSansDevanagari-Bold.ttf", "NotoSans-Regular.ttf", "NotoSans-Bold.ttf"):
+            dst = os.path.join(FONT_DIR, name)
+            if not os.path.exists(dst):
+                import shutil
+                shutil.copyfile(target, dst)
+        return pdf_fonts_available()
+    except Exception as exc:
+        log.warning("Could not obtain Noto PDF fonts: %s", type(exc).__name__)
+        return False
+
+
 def pdf_fonts_available() -> bool:
     return all(os.path.exists(os.path.join(FONT_DIR, f)) for fam in FONT_FILES.values() for f in fam)
 
 
+# Noto Sans Devanagari has no check/cross glyphs; map them (and bullets) to characters every PDF font can draw.
+_PDF_GLYPH_MAP = {"\u2714": "OK", "\u2718": "X", "\u2713": "OK", "\u2717": "X", "\u2022": "-", "\u00b7": "-"}
+
+
 def _pdf_safe(text: str) -> str:
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]", "", text or "")
+    t = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]", "", text or "")
+    for k, v in _PDF_GLYPH_MAP.items():
+        t = t.replace(k, v)
+    return t
 
 
 _LATIN_MAP = {"\u2014": "-", "\u2013": "-", "\u2012": "-", "\u2212": "-", "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
@@ -4776,7 +4831,7 @@ def build_result_pdf(test: AiTest, questions: list[AiTestQuestion], student: str
     missing (or fail to load) it still produces a Latin-only PDF (Hindi would be unreadable) — the caller warns the user."""
     from fpdf import FPDF
 
-    unicode_ok = pdf_fonts_available()
+    unicode_ok = ensure_pdf_fonts()
     FAM = "Helvetica"
     txt = lambda s: _pdf_wrap_long(_pdf_latin(s))   # noqa: E731
 
@@ -5099,6 +5154,17 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
     if action == "toggle" and a2 in ("purchases_enabled", "trial_enabled"):
         cur = await setting_bool(session, a2, True); await set_setting(session, a2, "false" if cur else "true")
         await audit(session, actor, f"setting.{a2}", str(not cur)); await cb.answer("Toggled")
+        text, kb = await plan_screen(session); await edit(text, kb); return
+    if action == "freemode":
+        enabled = not await setting_bool(session, "free_mode_enabled", False)
+        await set_setting(session, "free_mode_enabled", "true" if enabled else "false")
+        if enabled:
+            # Avoid accidental trial/payment prompts when the owner deliberately opens the bot for free.
+            await set_setting(session, "purchases_enabled", "false")
+            await set_setting(session, "trial_enabled", "false")
+        await audit(session, actor, "setting.free_mode", "enabled" if enabled else "disabled")
+        await session.commit()
+        await cb.answer("Unlimited free mode ON" if enabled else "Unlimited free mode OFF", show_alert=True)
         text, kb = await plan_screen(session); await edit(text, kb); return
     if action == "pay":
         status = a2 or PAY_PENDING; await cb.answer()
