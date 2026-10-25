@@ -139,10 +139,16 @@ BUTTON_LABEL_LIMIT = 48          # longer options get a concise label + "Show fu
 TIERS = ("free", "trial", "premium", "admin")
 FEATURE_KEYS = ("ai", "image", "aitest", "quiz", "mock", "materials", "leaderboard", "payments")
 LIMIT_KEYS = ("ai_daily", "image_daily", "aitest_daily", "aitest_max_q", "quiz_daily", "mock_daily", "materials")
+# Auto-cleanup & Render resource protection constants
+RETENTION_HOURS = int(os.getenv("CHAT_RETENTION_HOURS", "24"))  # Auto-delete old chats & temporary DB records after 24 hours (1 day)
+CLEANUP_INTERVAL_SEC = 1800  # Run DB & chat cleanup every 30 minutes
+FREE_MODE_DEFAULT = os.getenv("FREE_MODE_DEFAULT", "true").lower() in {"1", "true", "yes", "on"}
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+
 DEFAULT_POLICIES: dict[str, dict[str, int]] = {
-    # -1 = unlimited, 0 = not allowed
-    "free":    {"ai_daily": 3,  "image_daily": 1,  "aitest_daily": 1,  "aitest_max_q": 10, "quiz_daily": 10, "mock_daily": 0,  "materials": 0},
-    "trial":   {"ai_daily": 10, "image_daily": 5,  "aitest_daily": 3,  "aitest_max_q": 20, "quiz_daily": 50, "mock_daily": 2,  "materials": 1},
+    # -1 = unlimited, 0 = not allowed (Generous defaults so users never hit 'Daily limit reached' unexpectedly)
+    "free":    {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
+    "trial":   {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
     "premium": {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
     "admin":   {"ai_daily": -1, "image_daily": -1, "aitest_daily": -1, "aitest_max_q": 50, "quiz_daily": -1, "mock_daily": -1, "materials": 1},
 }
@@ -489,7 +495,21 @@ class AuditLog(Base):
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
-engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
+class EphemeralMessage(Base):
+    """Stores ONLY message IDs (never chat text/media) so old chat messages can be auto-deleted from Telegram after 1 day."""
+    __tablename__ = "ephemeral_messages"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    message_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now_utc, index=True)
+
+
+_ENGINE_KWARGS: dict[str, Any] = {"pool_pre_ping": True}
+if not IS_SQLITE:
+    # Strict pool sizing for Render free/starter PostgreSQL so connection limits are never exceeded
+    _ENGINE_KWARGS.update({"pool_size": 3, "max_overflow": 2, "pool_recycle": 300, "pool_timeout": 20})
+
+engine = create_async_engine(DATABASE_URL, **_ENGINE_KWARGS)
 Session = async_sessionmaker(engine, expire_on_commit=False)
 router = Router()
 dp = Dispatcher()
@@ -804,9 +824,9 @@ TIER_LABEL = {"free": "Free (no active plan)", "trial": "Free Trial", "premium":
 
 
 async def effective_limits(session: AsyncSession, user: User) -> dict[str, int]:
-    # Admin's one-click free mode bypasses every quota for all non-banned users.
+    # Admin's one-click free mode bypasses every quota for all non-banned users (ON by default so users don't hit limits).
     # Feature switches, access grants and maintenance mode remain separate safety controls.
-    if await setting_bool(session, "free_mode_enabled", False) and not user.is_admin:
+    if await setting_bool(session, "free_mode_enabled", FREE_MODE_DEFAULT) and not user.is_admin:
         return {key: -1 for key in LIMIT_KEYS}
     tier = user_tier(user)
     limits = dict((await load_policies(session))[tier])
@@ -1672,13 +1692,33 @@ def classify_http_error(status: int, body: str) -> str:
     return "http"
 
 
+_HTTP_CLIENT: httpx.AsyncClient | None = None
+
+
+def get_http_client() -> httpx.AsyncClient:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None or _HTTP_CLIENT.is_closed:
+        _HTTP_CLIENT = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=15.0),
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+    return _HTTP_CLIENT
+
+
+async def close_http_client() -> None:
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is not None and not _HTTP_CLIENT.is_closed:
+        await _HTTP_CLIENT.aclose()
+        _HTTP_CLIENT = None
+
+
 async def gemini_request(payload: dict[str, Any], api_key: str, *, model: str | None = None, timeout: float = 60.0) -> dict[str, Any]:
     if not api_key:
         raise AIError("no_key")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_MODEL}:generateContent"
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=15.0)) as client:
-            r = await client.post(url, params={"key": api_key}, json=payload)
+        client = get_http_client()
+        r = await client.post(url, params={"key": api_key}, json=payload, timeout=timeout)
     except httpx.TimeoutException as e:
         raise AIError("timeout", str(e))
     except httpx.HTTPError as e:
@@ -1930,7 +1970,7 @@ def render_fallback_answer(raw_text: str, style: str, lang: str) -> str:
     return formatted
 
 
-LAST_Q_TTL = 6 * 3600          # the latest question stays switchable for 6 hours
+LAST_Q_TTL = 3600              # the latest question stays switchable in RAM only for 1 hour (never saved to DB)
 FRIENDLY_AI_ERROR = {
     "hi": "दोस्त, अभी जवाब generate नहीं हो पा रहा है। थोड़ी देर बाद Retry करो।",
     "en": "Dost, abhi jawab generate nahi ho pa raha hai. Thodi der baad retry karo.",
@@ -4478,13 +4518,13 @@ async def plan_screen(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]
             f"Plan name: <b>{esc(p['name'])}</b>\nPrice: <b>₹{p['price']:.2f}</b>\nValidity: <b>{validity_label(p['validity_days'])}</b>\n"
             f"UPI ID: <code>{esc(p['upi_id']) or '—'}</code>\nPayee name: {esc(p['payee']) or '—'}\nPurchases: {'enabled' if p['purchases_enabled'] else 'DISABLED'}\n"
             f"Trial: {'enabled' if await setting_bool(session, 'trial_enabled', True) else 'disabled'} · {await setting_int(session, 'trial_days', 7)} days\n"
-            f"Unlimited free mode: {'ON — all usage limits bypassed' if await setting_bool(session, 'free_mode_enabled', False) else 'OFF'}\n\n" + "\n".join(warn))
+            f"Unlimited free mode: {'ON — all usage limits bypassed' if await setting_bool(session, 'free_mode_enabled', FREE_MODE_DEFAULT) else 'OFF'}\n\n" + "\n".join(warn))
     kb = inline([
         [("✏️ Plan name", "adm:set:plan_name"), ("💰 Price", "adm:set:plan_price")],
         [("📆 Validity (days, 0=lifetime)", "adm:set:plan_validity_days")],
         [("🏦 UPI ID", "adm:set:upi_id"), ("👤 Payee name", "adm:set:upi_payee")],
         [("🛒 Toggle purchases", "adm:toggle:purchases_enabled"), ("🎁 Toggle trial", "adm:toggle:trial_enabled")],
-        [(("🛑 Disable unlimited free mode" if await setting_bool(session, "free_mode_enabled", False) else "🆓 Enable unlimited free mode"), "adm:freemode")],
+        [(("🛑 Disable unlimited free mode" if await setting_bool(session, "free_mode_enabled", FREE_MODE_DEFAULT) else "🆓 Enable unlimited free mode"), "adm:freemode")],
         [("🎁 Trial days", "adm:set:trial_days"), ("👁 Preview payment screen", "adm:plan:preview")],
         BACK_ADMIN])
     return text, kb
@@ -5156,7 +5196,7 @@ async def admin_callbacks(cb: CallbackQuery, session: AsyncSession, db_user: Use
         await audit(session, actor, f"setting.{a2}", str(not cur)); await cb.answer("Toggled")
         text, kb = await plan_screen(session); await edit(text, kb); return
     if action == "freemode":
-        enabled = not await setting_bool(session, "free_mode_enabled", False)
+        enabled = not await setting_bool(session, "free_mode_enabled", FREE_MODE_DEFAULT)
         await set_setting(session, "free_mode_enabled", "true" if enabled else "false")
         if enabled:
             # Avoid accidental trial/payment prompts when the owner deliberately opens the bot for free.
@@ -5508,6 +5548,8 @@ async def export_portable_backup() -> tuple[bytes, dict[str, int]]:
         if not IS_SQLITE:
             await conn.execute(sa_text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"))
         for table in Base.metadata.sorted_tables:
+            if table.name == "ephemeral_messages":
+                continue
             rows = (await conn.execute(select(table))).mappings().all()
             payload["tables"][table.name] = [{k: _json_value(v) for k, v in r.items()} for r in rows]
             counts[table.name] = len(rows)
@@ -5598,8 +5640,10 @@ async def restore_portable_backup(payload: dict[str, Any]) -> dict[str, int]:
                             f"(SELECT MAX({c.name}) FROM {table.name}) IS NOT NULL)"))
         # Verify inside the same transaction: every table must hold exactly the rows we wrote.
         for table in Base.metadata.sorted_tables:
+            if table.name == "ephemeral_messages":
+                continue
             n = int((await conn.execute(select(func.count()).select_from(table))).scalar_one())
-            if n != counts[table.name]:
+            if n != counts.get(table.name, 0):
                 raise RuntimeError(f"verification failed for {table.name}: {n} rows present, {counts[table.name]} expected")
         if IS_SQLITE:
             bad = (await conn.execute(sa_text("PRAGMA foreign_key_check"))).all()
@@ -6173,12 +6217,44 @@ async def admin_quick_commands(message: Message, session: AsyncSession, db_user:
 
 
 # ============================ Infrastructure ============================
+async def track_ephemeral_message(chat_id: int | None, message_id: int | None) -> None:
+    """Record only (chat_id, message_id) so old chat messages can be auto-deleted after 24h. Never stores message text."""
+    if not chat_id or not message_id or chat_id < 0:
+        return
+    try:
+        async with Session() as s:
+            s.add(EphemeralMessage(chat_id=chat_id, message_id=message_id, created_at=now_utc()))
+            await s.commit()
+    except Exception:
+        pass
+
+
+def install_bot_message_tracker(bot: Bot) -> None:
+    """Wrap Bot API calls so every outgoing bot message in private chats is scheduled for 24-hour auto-deletion."""
+    orig_call = bot.__call__
+
+    async def tracked_call(method, request_timeout=None):
+        res = await orig_call(method, request_timeout=request_timeout)
+        try:
+            mname = type(method).__name__
+            if mname in ("SendMessage", "SendPhoto", "SendDocument") and isinstance(res, Message):
+                if res.chat and res.chat.type == "private":
+                    asyncio.create_task(track_ephemeral_message(res.chat.id, res.message_id))
+        except Exception:
+            pass
+        return res
+
+    bot.__call__ = tracked_call  # type: ignore[method-assign]
+
+
 class DBMiddleware:
-    """One session per update, committed after the handler, rolled back on error. Injects db_user."""
+    """One session per update, committed after the handler, rolled back on error. Injects db_user and tracks user message IDs for 24h auto-delete."""
     async def __call__(self, handler, event, data):
         tg_user = getattr(event, "from_user", None)
         if not tg_user or tg_user.is_bot:
             return await handler(event, data)
+        if isinstance(event, Message) and event.chat and event.chat.type == "private":
+            asyncio.create_task(track_ephemeral_message(event.chat.id, event.message_id))
         async with Session() as session:
             user = await get_user(session, tg_user)
             await session.commit()
@@ -6214,12 +6290,18 @@ async def seed_default_exams():
         await session.commit()
 
 
+async def purge_finished_test_questions(session: AsyncSession, test_id: int) -> None:
+    """Delete stored question/chat text once a test is older than RETENTION_HOURS so the DB never bloats."""
+    await session.execute(sa_text("DELETE FROM ai_test_questions WHERE test_id = :tid"), {"tid": test_id})
+
+
 async def expiry_loop(bot: Bot, stop: asyncio.Event):
-    """Every 30 s: auto-submit timed tests past their deadline and notify the student."""
+    """Every 30 s: auto-submit timed tests past their deadline and abandon stale in-progress tests (>24h)."""
     while not stop.is_set():
         try:
             async with Session() as session:
-                tests = list((await session.execute(select(AiTest).where(AiTest.status == "in_progress", AiTest.deadline_at.is_not(None), AiTest.deadline_at <= now_utc()))).scalars())
+                now = now_utc()
+                tests = list((await session.execute(select(AiTest).where(AiTest.status == "in_progress", AiTest.deadline_at.is_not(None), AiTest.deadline_at <= now))).scalars())
                 for t in tests:
                     await finalize_test(session, t, await load_test_questions(session, t), status="expired")
                     await session.commit()
@@ -6227,12 +6309,129 @@ async def expiry_loop(bot: Bot, stop: asyncio.Event):
                         await show_result(bot, session, t, note="⏰ Time is over — the test was submitted automatically.")
                     except TelegramAPIError as e:
                         log.warning("Could not deliver expiry result for test %s: %r", t.id, e)
+                # Abandon stale unfinished tests older than RETENTION_HOURS so users & DB are never stuck
+                stale_cutoff = now - timedelta(hours=RETENTION_HOURS)
+                stale_tests = list((await session.execute(select(AiTest).where(AiTest.status == "in_progress", AiTest.created_at <= stale_cutoff))).scalars())
+                for st in stale_tests:
+                    await finalize_test(session, st, await load_test_questions(session, st), status="abandoned")
+                if stale_tests:
+                    await session.commit()
         except Exception:
             log.exception("Expiry task failed")
         try:
             await asyncio.wait_for(stop.wait(), timeout=30)
         except asyncio.TimeoutError:
             pass
+
+
+async def auto_cleanup_loop(bot: Bot, stop: asyncio.Event):
+    """Runs every 30 minutes:
+    1. Deletes Telegram chat messages older than 24 hours (1 day) and removes their EphemeralMessage rows.
+    2. Purges old temporary DB data (>24 hours): AiTestQuestion, AiTest, Practice attempts, MockAttempt, old UsageCounter, old AuditLog, cancelled/rejected PaymentRequests.
+    3. Cleans up in-memory caches (MEMBERSHIP_CACHE, TEST_LOCKS, TV_LAST, FSM storage) so RAM never leaks on Render.
+    """
+    while not stop.is_set():
+        try:
+            cutoff = now_utc() - timedelta(hours=RETENTION_HOURS)
+            old_day = (datetime.now(IST) - timedelta(days=1)).strftime("%Y-%m-%d")
+            # 1. Auto-delete old Telegram chat messages (>24h)
+            async with Session() as session:
+                old_msgs = list((await session.execute(
+                    select(EphemeralMessage).where(EphemeralMessage.created_at <= cutoff).order_by(EphemeralMessage.id).limit(400)
+                )).scalars())
+                if old_msgs:
+                    deleted_ids = []
+                    for em in old_msgs:
+                        deleted_ids.append(em.id)
+                        try:
+                            await bot.delete_message(chat_id=em.chat_id, message_id=em.message_id)
+                        except TelegramAPIError:
+                            pass  # Already deleted by user or >48h limit on Telegram side
+                        await asyncio.sleep(0.02)
+                    await session.execute(sa_text("DELETE FROM ephemeral_messages WHERE id IN (" + ",".join(map(str, deleted_ids)) + ")"))
+                    await session.commit()
+
+            # 2. Purge temporary DB records older than 1 day so DB storage limit is never reached
+            async with Session() as session:
+                # Delete AI test question snapshots and old test sessions older than 24h
+                await session.execute(
+                    sa_text("DELETE FROM ai_test_questions WHERE test_id IN (SELECT id FROM ai_tests WHERE created_at <= :c AND status != 'in_progress')"),
+                    {"c": cutoff},
+                )
+                await session.execute(
+                    sa_text("DELETE FROM ai_tests WHERE created_at <= :c AND status != 'in_progress'"),
+                    {"c": cutoff},
+                )
+                # Delete old daily quiz practice attempts (>24h)
+                await session.execute(sa_text("DELETE FROM practice_attempts WHERE served_at <= :c"), {"c": cutoff})
+                # Delete legacy mock attempts (>24h)
+                await session.execute(sa_text("DELETE FROM mock_attempts WHERE started_at <= :c"), {"c": cutoff})
+                # Delete old daily usage counters (prior days)
+                await session.execute(sa_text("DELETE FROM usage_counters WHERE day < :d"), {"d": old_day})
+                # Delete audit logs older than 24h
+                await session.execute(sa_text("DELETE FROM audit_logs WHERE at <= :c"), {"c": cutoff})
+                # Delete abandoned/cancelled/rejected payment requests older than 24h (keep approved ones)
+                await session.execute(
+                    sa_text("DELETE FROM payment_requests WHERE created_at <= :c AND status IN ('awaiting_utr', 'awaiting_screenshot', 'cancelled', 'rejected')"),
+                    {"c": cutoff},
+                )
+                await session.commit()
+
+            # If SQLite, run PRAGMA optimize / incremental cleanup
+            if IS_SQLITE:
+                async with engine.begin() as conn:
+                    await conn.execute(sa_text("PRAGMA optimize"))
+
+            # 3. Prune in-memory caches to prevent RAM exhaustion on Render (512 MB limit)
+            now_mono = time.monotonic()
+            expired_m = [k for k, exp in list(MEMBERSHIP_CACHE.items()) if exp <= now_mono]
+            for k in expired_m:
+                MEMBERSHIP_CACHE.pop(k, None)
+            if len(TEST_LOCKS) > 500:
+                for k in list(TEST_LOCKS.keys())[:250]:
+                    if not TEST_LOCKS[k].locked():
+                        TEST_LOCKS.pop(k, None)
+            TV_LAST.clear()
+            # Clear stale FSM states older than RETENTION_HOURS
+            storage = getattr(dp, "storage", None)
+            if storage and hasattr(storage, "storage") and isinstance(storage.storage, dict):
+                now_ts = time.time()
+                for skey in list(storage.storage.keys()):
+                    rec = storage.storage.get(skey)
+                    data = getattr(rec, "data", None)
+                    if isinstance(data, dict):
+                        lq = data.get("last_q")
+                        if isinstance(lq, dict) and now_ts - float(lq.get("ts", 0)) > LAST_Q_TTL:
+                            data.pop("last_q", None)
+                        if not data and getattr(rec, "state", None) is None:
+                            storage.storage.pop(skey, None)
+        except Exception:
+            log.exception("Auto-cleanup task error")
+
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=CLEANUP_INTERVAL_SEC)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def keep_alive_loop(port: int, stop: asyncio.Event):
+    """Pings the local health server (and RENDER_EXTERNAL_URL if set) every 4 minutes so Render Web Service stays responsive."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=240)
+        except asyncio.TimeoutError:
+            pass
+        if stop.is_set():
+            break
+        client = get_http_client()
+        urls = [f"http://127.0.0.1:{port}/health"]
+        if RENDER_EXTERNAL_URL.startswith("http"):
+            urls.append(RENDER_EXTERNAL_URL.rstrip("/") + "/health")
+        for u in urls:
+            try:
+                await client.get(u, timeout=10.0)
+            except Exception:
+                pass
 
 
 PUBLIC_COMMANDS = [
@@ -6330,10 +6529,27 @@ def validate_startup_config() -> None:
 
 async def main():
     validate_startup_config()
+    # Bind Render's PORT immediately BEFORE database initialization so Render never marks the deployment as failed/timed-out
+    async def health(_request):
+        conflict = polling_conflict_active()
+        return web.json_response({"status": "degraded" if conflict else "ok", "service": "ExamYatra",
+                                  "polling": "conflict" if conflict else "ok", "time": now_utc().isoformat()})
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_get("/ping", health)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    await web.TCPSite(runner, host="0.0.0.0", port=port).start()
+    log.info("Health server listening on 0.0.0.0:%s", port)
+
     log.info("Database: %s", re.sub(r"://[^@/]+@", "://***@", DATABASE_URL))
     try:
         await ensure_schema()
     except Exception as e:
+        await runner.cleanup()
         raise SystemExit(f"Database initialisation failed: {type(e).__name__}: {e}")
     await seed_default_exams()
     dp.message.middleware(DBMiddleware())
@@ -6342,29 +6558,21 @@ async def main():
     dp.callback_query.middleware(AccessMiddleware())
     dp.errors.register(on_error)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    install_bot_message_tracker(bot)
     stop = asyncio.Event()
     logging.getLogger("aiogram").addHandler(ConflictLogHandler())
     expiry_task = asyncio.create_task(expiry_loop(bot, stop))
+    cleanup_task = asyncio.create_task(auto_cleanup_loop(bot, stop))
+    keepalive_task = asyncio.create_task(keep_alive_loop(port, stop))
     watchdog_task = asyncio.create_task(conflict_watchdog(bot, stop))
 
-    async def health(_request):
-        conflict = polling_conflict_active()
-        return web.json_response({"status": "degraded" if conflict else "ok", "service": "ExamYatra",
-                                  "polling": "conflict" if conflict else "ok", "time": now_utc().isoformat()})
-    app = web.Application(); app.router.add_get("/", health); app.router.add_get("/health", health)
-    runner = web.AppRunner(app); await runner.setup()
-    port = int(os.getenv("PORT", "10000"))
-    await web.TCPSite(runner, host="0.0.0.0", port=port).start()
-    log.info("Health server listening on 0.0.0.0:%s", port)
     try:
-        drop_backlog = os.getenv("DROP_PENDING_UPDATES", "false").lower() in ("1", "true", "yes")
+        drop_backlog = os.getenv("DROP_PENDING_UPDATES", "true").lower() in ("1", "true", "yes")
         await bot.delete_webhook(drop_pending_updates=drop_backlog)
         me = await bot.get_me()
         await register_commands(bot)
         await notify_startup_warnings(bot)
-        log.info("Exam Yatra started as @%s (model %s, admins %s)", me.username, GEMINI_MODEL, sorted(ADMIN_IDS))
-        # DROP_PENDING_UPDATES=true skips the backlog accumulated while the service was down (default: process it).
-        # A second instance with the same token raises TelegramConflictError — run exactly one instance.
+        log.info("Exam Yatra started as @%s (model %s, admins %s, retention %sh)", me.username, GEMINI_MODEL, sorted(ADMIN_IDS), RETENTION_HOURS)
         log.info("Pending Telegram updates will be %s on startup (DROP_PENDING_UPDATES=%s).", "DISCARDED" if drop_backlog else "processed", drop_backlog)
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -6372,17 +6580,36 @@ async def main():
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(dp.stop_polling()))
             except (NotImplementedError, RuntimeError):
                 pass
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types(), close_bot_session=False, drop_pending_updates=drop_backlog)
-    except TelegramConflictError:
-        log.error("Another process is polling with this BOT_TOKEN. Stop every other Render service, local process, Termux copy or old deployment, then restart this one.")
-        raise
-    except TelegramUnauthorizedError:
-        log.error("Telegram rejected BOT_TOKEN. Check the token from @BotFather."); raise
+        # Resilient polling loop: automatically recovers from transient network glitches on Render without crashing the container
+        while not stop.is_set():
+            try:
+                await dp.start_polling(
+                    bot,
+                    allowed_updates=dp.resolve_used_update_types(),
+                    close_bot_session=False,
+                    drop_pending_updates=drop_backlog,
+                    handle_signals=False,
+                )
+                break
+            except TelegramConflictError:
+                log.warning("TelegramConflictError during Render rolling deploy; waiting 10s before retrying polling...")
+                await asyncio.sleep(10)
+            except TelegramUnauthorizedError:
+                log.error("Telegram rejected BOT_TOKEN. Check the token from @BotFather.")
+                raise
+            except Exception as e:
+                log.exception("Polling interrupted (%r); restarting polling in 5s...", e)
+                await asyncio.sleep(5)
     finally:
-        stop.set(); expiry_task.cancel(); watchdog_task.cancel()
-        for _t in (expiry_task, watchdog_task):
-            try: await _t
-            except (asyncio.CancelledError, Exception): pass
+        stop.set()
+        for _t in (expiry_task, cleanup_task, keepalive_task, watchdog_task):
+            _t.cancel()
+        for _t in (expiry_task, cleanup_task, keepalive_task, watchdog_task):
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):
+                pass
+        await close_http_client()
         await runner.cleanup()
         await bot.session.close()
         await engine.dispose()
